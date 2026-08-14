@@ -12,45 +12,48 @@ Shared CI/CD library for dacha-na-udachu and wb-parser-enterprise.
 - `.just/docker-compose.just` — Docker prune/cleanup recipes
 - `.just/deploy.just` — 7-step deploy pipeline recipes
 
-## Usage from a project
+## Setup (submodule)
 
-### Option A: Import in project's justfile
+Both consuming projects add this as a git submodule:
+
+```bash
+# dacha
+git submodule add <url> lib/deploy-common
+
+# wb-parser
+git submodule add <url> lib/deploy-common
+```
+
+On the VPS, after cloning a project:
+```bash
+git clone <project-repo>
+git submodule update --init --recursive
+```
+
+## Usage
+
+### Dacha (just-native)
 
 ```just
-# In your justfile:
-import '/mnt/Backup/deploy-common/.just/deploy.just'
-import '/mnt/Backup/deploy-common/.just/caddy.just'
-
-# Override variables as needed:
-PROJECT_CADDY_SNIPPET := "webcrawler"
-COMPOSE_FILE := "docker-compose.prod.yml"
-
-# Wire the shared deploy steps:
-prod-deploy: deploy-git-pull deploy-caddy-bootstrap deploy-caddy-config deploy-compose-up deploy-caddy-reload deploy-smoke-test deploy-clean
+# justfile:
+DEPLOY_COMMON := justfile_directory() / "lib" / "deploy-common"
+# ... import or call deploy-common recipes directly
 ```
 
-### Option B: Use the scripts directly in deploy.sh
+### wb-parser (bash deploy.sh)
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-DEPLOY_COMMON="${DEPLOY_COMMON:-/mnt/Backup/deploy-common}"
+DEPLOY_COMMON="${DEPLOY_COMMON:-$PROJECT_DIR/lib/deploy-common}"
 source "$DEPLOY_COMMON/lib/shared-functions.sh"
 source "$DEPLOY_COMMON/scripts/caddy-bootstrap.sh"
-
-# ... use bootstrap_caddy, log, warn, die, etc.
 ```
 
-### Option C: Full pipeline via just
+### Direct from deploy-common justfile (e.g. on VPS)
 
 ```bash
-# On VPS, after cloning the project:
-cd /path/to/project
-PROJECT_SNIPPET=deploy/caddy.conf.caddy \
-COMPOSE_FILE=docker-compose.yml \
-TAG=$(git rev-parse --short HEAD) \
-just -u /mnt/Backup/deploy-common/justfile deploy-full
+DEPLOY_COMMON=/path/to/deploy-common \
+SMOKE_URL=https://example.com \
+just -u /path/to/deploy-common/justfile deploy-full
 ```
 
 ## Canonical Caddyfile
@@ -58,14 +61,17 @@ just -u /mnt/Backup/deploy-common/justfile deploy-full
 Both projects must use `deploy-common/caddy.bootstrap/Caddyfile` as the canonical source.
 Do NOT maintain a separate copy in each project — any change to Caddy bootstrap goes here.
 
-## On the VPS
+## Pushing updates
 
-deploy-common should live at a fixed path that both projects reference:
+When deploy-common changes, commit and push in deploy-common, then update each consuming project:
 
+```bash
+# In deploy-common
+git push
+
+# In each consuming project
+cd lib/deploy-common && git pull origin master && cd ../..
+git add lib/deploy-common
+git commit -m "chore: update deploy-common"
+git push
 ```
-/mnt/Backup/deploy-common          # on this machine
-/mnt/Backup/deploy-common         # on wb-parser VPS
-```
-
-Set `DEPLOY_COMMON` env var to override the default path, or pass the path
-explicitly when importing justfiles.
