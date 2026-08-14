@@ -3,8 +3,6 @@
 # Shared docker-compose operations used in CI/CD pipelines.
 # ==============================================================================
 
-DEPLOY_COMMON := justfile_directory() / ".just" / ".." / ".just" / ".."
-
 [doc("Prune unused Docker assets (containers, networks, dangling images)")]
 docker-prune:
     docker system prune -f

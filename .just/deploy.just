@@ -4,11 +4,6 @@
 # Each project wires these into their own justfile or deploy.sh as needed.
 # ==============================================================================
 
-DEPLOY_COMMON := justfile_directory() / ".just" / ".." / ".just" / ".."
-CADDY_BASE := env("CADDY_BASE", "/opt/caddy")
-CONF_D := CADDY_BASE + "/conf.d"
-BACKUP_TTL := 5
-
 [doc("Deploy step 1: git pull")]
 deploy-git-pull:
     #!/usr/bin/env bash
@@ -27,9 +22,9 @@ deploy-caddy-bootstrap:
     source {{ DEPLOY_COMMON }}/scripts/caddy-bootstrap.sh
     bootstrap_caddy
 
-[doc("Deploy step 3: write project Caddy route snippet and validate")]
 # Usage: PROJECT_SNIPPET=<path> just deploy-caddy-config
 # PROJECT_SNIPPET defaults to deploy/caddy.conf.caddy in project root
+[doc("Deploy step 3: write project Caddy route snippet and validate")]
 deploy-caddy-config:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -58,10 +53,11 @@ deploy-caddy-config:
         die "Caddy config validation failed — backup restored"
     fi
 
-    # Rotate old backups
+    # Rotate old backups (keep BACKUP_TTL most recent)
     BACKUP_COUNT=$(ls -1t "{{ CONF_D }}/${SNIPPET_NAME}.caddy".bak.* 2>/dev/null | wc -l)
     if [ "$BACKUP_COUNT" -gt "{{ BACKUP_TTL }}" ]; then
-        ls -1t "{{ CONF_D }}/${SNIPPET_NAME}.caddy".bak.* | tail -n +{{ BACKUP_TTL + 1 }} | xargs -r rm --
+        KEEP_PLUS_ONE=$(({{ BACKUP_TTL }} + 1))
+        ls -1t "{{ CONF_D }}/${SNIPPET_NAME}.caddy".bak.* | tail -n +"$KEEP_PLUS_ONE" | xargs -r rm --
         log "Rotated old backups (kept {{ BACKUP_TTL }})"
     fi
 
@@ -89,8 +85,8 @@ deploy-caddy-reload:
     source {{ DEPLOY_COMMON }}/scripts/caddy-reload.sh
     caddy_validate_and_reload
 
-[doc("Deploy step 6: verify endpoint connectivity")]
 # Usage: SMOKE_URL=https://example.com just deploy-smoke-test
+[doc("Deploy step 6: verify endpoint connectivity")]
 deploy-smoke-test:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -119,7 +115,7 @@ deploy-clean:
 
     log "✨ Cleanup complete. $(disk_usage)"
 
-[doc("Full deploy pipeline: bootstrap → git-pull → caddy-config → compose-up → caddy-reload → smoke-test → clean")]
 # Usage: PROJECT_SNIPPET=<path> COMPOSE_FILE=<file> TAG=<tag> just deploy-full
+[doc("Full deploy pipeline: bootstrap → git-pull → caddy-config → compose-up → caddy-reload → smoke-test → clean")]
 deploy-full: deploy-git-pull deploy-caddy-bootstrap deploy-caddy-config deploy-compose-up deploy-caddy-reload deploy-smoke-test deploy-clean
     @echo "✅ Deploy pipeline completed successfully."

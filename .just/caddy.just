@@ -3,13 +3,6 @@
 # Idempotent setup and reload of the global Caddy reverse proxy.
 # ==============================================================================
 
-# Path to deploy-common (computed from this file's location)
-DEPLOY_COMMON := justfile_directory() / ".just" / ".." / ".just" / ".."
-
-# Paths on the VPS host
-CADDY_BASE := env("CADDY_BASE", "/opt/caddy")
-CONF_D := CADDY_BASE + "/conf.d"
-
 # Canonical Caddy bootstrap config (checked into deploy-common)
 CADDY_BOOTSTRAP := DEPLOY_COMMON + "/caddy.bootstrap/Caddyfile"
 
