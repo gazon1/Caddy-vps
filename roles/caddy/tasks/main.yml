@@ -1,0 +1,43 @@
+---
+# Order matters: the route snippet is applied last, after the proxy is up and
+# the base configuration has been validated.
+
+- name: Preflight checks
+  ansible.builtin.import_tasks: preflight.yml
+  tags:
+    - caddy_infra
+
+- name: Ensure the shared Docker network exists
+  ansible.builtin.import_tasks: network.yml
+  tags:
+    - caddy_infra
+
+- name: Ensure the directory structure exists
+  ansible.builtin.import_tasks: directories.yml
+  tags:
+    - caddy_infra
+
+- name: Install the base Caddyfile and compose manifest
+  ansible.builtin.import_tasks: base_config.yml
+  tags:
+    - caddy_infra
+
+- name: Ensure the proxy container is running
+  ansible.builtin.import_tasks: container.yml
+  tags:
+    - caddy_infra
+
+- name: Validate the resulting configuration
+  ansible.builtin.import_tasks: validate.yml
+  tags:
+    - caddy_infra
+
+- name: Apply a route snippet
+  ansible.builtin.import_tasks: routes.yml
+  tags:
+    - caddy_routes
+
+- name: Rotate route snippet backups
+  ansible.builtin.import_tasks: rotate.yml
+  tags:
+    - caddy_routes

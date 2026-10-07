@@ -1,77 +1,164 @@
-# deploy-common
+# Caddy-vps — the one reverse proxy for the whole VPS
 
-Shared CI/CD library for dacha-na-udachu and wb-parser-enterprise.
+**What this is:** the Ansible code that installs and maintains a single Caddy
+reverse proxy on your VPS. Every project you deploy gets a hostname by adding
+one small file; you never run a second proxy and never fight anyone over
+ports 80 and 443.
 
-## What lives here
+**What it is not:** an application. It serves nothing of its own. It only
+forwards traffic to your project's containers.
 
-- `lib/shared-functions.sh` — logging, colours, retry loops, docker/caddy helpers
-- `scripts/caddy-bootstrap.sh` — idempotent Caddy network + container setup
-- `scripts/caddy-reload.sh` — validate + reload Caddy
-- `caddy.bootstrap/Caddyfile` — canonical base Caddyfile (single source of truth)
-- `.just/caddy.just` — Caddy management recipes
-- `.just/docker-compose.just` — Docker prune/cleanup recipes
-- `.just/deploy.just` — 7-step deploy pipeline recipes
+---
 
-## Setup (submodule)
+## How it fits together
 
-Both consuming projects add this as a git submodule:
+```
+   internet
+      │  :80 / :443
+      ▼
+┌──────────────────────────┐
+│  caddy_global            │   ← this repository
+│  /opt/caddy/Caddyfile    │
+│    import conf.d/*.caddy │
+└───────────┬──────────────┘
+            │  docker network: caddy_net
+            ├──────────────► frontend:3000
+            └──────────────► app:8080
+```
+
+Each project ships one file in `/opt/caddy/conf.d/`. Caddy imports the whole
+directory, so adding a project means adding a file and reloading — you never
+edit the shared config, and one project's mistake cannot break another's route.
+
+Projects reach the proxy by joining `caddy_net` in their compose file. Nothing
+of theirs is published to the host.
+
+---
+
+## Setup, once per machine
 
 ```bash
-# dacha
-git submodule add <url> lib/deploy-common
+git clone git@github.com:gazon1/Caddy-vps.git
+cd Caddy-vps
 
-# wb-parser
-git submodule add <url> lib/deploy-common
+pipx install ansible-core ansible-lint
+pipx inject ansible-core requests        # community.docker needs it at runtime
+ansible-galaxy collection install -r requirements.yml
 ```
 
-On the VPS, after cloning a project:
-```bash
-git clone <project-repo>
-git submodule update --init --recursive
-```
+The `requests` line is not optional. `community.docker` imports it, and without
+it the run dies with *"Failed to import the required Python library (requests)"*.
 
-## Usage
+Then tell it where your server is — open `inventory/hosts.yml` and fill in
+`ansible_host` and `ansible_user`.
 
-### Dacha (just-native)
-
-```just
-# justfile:
-DEPLOY_COMMON := justfile_directory() / "lib" / "deploy-common"
-# ... import or call deploy-common recipes directly
-```
-
-### wb-parser (bash deploy.sh)
+## Using it, once per server
 
 ```bash
-DEPLOY_COMMON="${DEPLOY_COMMON:-$PROJECT_DIR/lib/deploy-common}"
-source "$DEPLOY_COMMON/lib/shared-functions.sh"
-source "$DEPLOY_COMMON/scripts/caddy-bootstrap.sh"
+just bootstrap
 ```
 
-### Direct from deploy-common justfile (e.g. on VPS)
+That is the whole first-time install. It is safe to run again at any time: a
+second run changes nothing, because everything is declarative.
+
+Requires on the VPS: `docker` with the **compose v2 plugin**. Nothing else —
+no Python, no Ansible on the server.
+
+## Adding a project
+
+Write the route snippet, then apply it:
 
 ```bash
-DEPLOY_COMMON=/path/to/deploy-common \
-SMOKE_URL=https://example.com \
-just -u /path/to/deploy-common/justfile deploy-full
+just route myproject deploy/myproject.conf.caddy
 ```
 
-## Canonical Caddyfile
+```caddy
+myproject.example.com {
+    encode zstd gzip
+    @api path /api/* /health/*
+    reverse_proxy @api app:8080
+    reverse_proxy frontend:3000
+}
+```
 
-Both projects must use `deploy-common/caddy.bootstrap/Caddyfile` as the canonical source.
-Do NOT maintain a separate copy in each project — any change to Caddy bootstrap goes here.
+The snippet is backed up, validated, and only then reloaded. If Caddy rejects
+it, the previous version is restored and the run fails loudly — the proxy
+never ends up holding a config it cannot load.
 
-## Pushing updates
-
-When deploy-common changes, commit and push in deploy-common, then update each consuming project:
+If you prefer Ansible variables to a file:
 
 ```bash
-# In deploy-common
-git push
-
-# In each consuming project
-cd lib/deploy-common && git pull origin master && cd ../..
-git add lib/deploy-common
-git commit -m "chore: update deploy-common"
-git push
+ansible-playbook site.yml --tags caddy_routes \
+  -e caddy_route_name=myproject -e caddy_site=myproject.example.com \
+  -e caddy_routes='[{"name":"api","paths":["/api/*"],"upstream":"app:8080"}]'
 ```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `just` | this list |
+| `just bootstrap` | install or repair the proxy (idempotent) |
+| `just route <name> <file>` | apply one route snippet, with backup and rollback |
+| `just status` | read-only: container, config validity, routes, modules |
+| `just lab-test` | prove all of the above locally, without touching the VPS |
+
+## Configuration
+
+Defaults live in `roles/caddy/defaults/main.yml`; anything can be overridden
+per host in `inventory/group_vars/vps.yml` or on the command line with `-e`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `caddy_base` | `/opt/caddy` | root of the installation |
+| `caddy_conf_d` | derived | where route snippets live |
+| `caddy_container` | `caddy_global` | container name |
+| `caddy_network` | `caddy_net` | network projects join |
+| `caddy_http_port` / `caddy_https_port` | `80` / `443` | **host** ports |
+| `caddy_image` | `caddy:2.8-alpine` | pinned on purpose — floating tags make deploys unreproducible |
+| `caddy_acme_email` | — | Let's Encrypt account address |
+| `caddy_tls_mode` | `auto` | `auto` = real certificates; `internal` = self-signed, no domain needed |
+| `caddy_backup_ttl` | `5` | snippet backups kept per snippet |
+| `caddy_publish_admin` | `false` | expose the admin API on host loopback for debugging |
+
+## Certificates
+
+`caddy_tls_mode: auto` issues real Let's Encrypt certificates over HTTP-01, so
+the site address must be a real domain with an A record pointing at the
+server. `internal` issues a self-signed certificate instead — useful for
+testing or when there is no domain yet, but browsers will warn.
+
+Certificates live in `/opt/caddy/data`. **That directory must never be
+deleted or pruned.** Losing it forces every certificate to be reissued and
+burns through the Let's Encrypt rate limit.
+
+## Testing changes without the VPS
+
+```bash
+just lab-test
+```
+
+Provisions a throwaway proxy under `/tmp/caddy-lab` on non-standard ports,
+then checks that a first run works, that a second run changes nothing, that an
+invalid snippet is rejected and rolled back, and that the proxy keeps serving
+the previous route throughout. ACME is never contacted.
+
+## Repository layout
+
+```
+site.yml                 the one entry point
+playbooks/status.yml     read-only inspection
+roles/caddy/             the role: tasks, templates, handlers
+inventory/               where the servers are, and their defaults
+tests/lab.sh             local verification suite
+docs/RUNBOOK.md          when something breaks
+```
+
+## When something breaks
+
+Start with `just status` — it reports the container state, whether the running
+configuration is valid, which routes are installed, and which non-standard
+modules are compiled in. It never changes anything.
+
+For rollbacks, certificate problems and recovery procedures, see
+[docs/RUNBOOK.md](docs/RUNBOOK.md).

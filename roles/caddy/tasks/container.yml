@@ -1,0 +1,15 @@
+---
+# `wait: true` blocks until the container reports healthy. The healthcheck in
+# the compose manifest runs `caddy validate`, so this waits for a proxy that can
+# actually start — unlike `docker compose wait`, which blocks until containers
+# STOP and therefore hangs forever on a detached, long-running service.
+
+- name: Ensure the proxy container is present and running
+  community.docker.docker_compose_v2:
+    project_src: "{{ caddy_base }}"
+    files:
+      - "{{ caddy_compose_file | basename }}"
+    state: present
+    wait: true
+    wait_timeout: "{{ caddy_health_timeout }}"
+    pull: missing

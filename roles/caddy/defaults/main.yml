@@ -1,0 +1,64 @@
+---
+# Every value that can be overridden. Paths derived from caddy_base follow it
+# automatically, so pointing the whole install somewhere else is a single -e.
+
+# --- Where things live -------------------------------------------------------
+caddy_base: /opt/caddy
+caddy_conf_d: "{{ caddy_base }}/conf.d"
+caddy_compose_file: "{{ caddy_base }}/docker-compose.caddy.yml"
+
+# --- Docker topology ---------------------------------------------------------
+caddy_network: caddy_net
+caddy_container: caddy_global
+caddy_image: caddy:2.8-alpine
+
+# HOST ports. The container itself always listens on 80/443.
+caddy_http_port: 80
+caddy_https_port: 443
+
+# --- Caddy behaviour ---------------------------------------------------------
+caddy_acme_email: drobin.me@yandex.ru
+# auto     — Let's Encrypt via HTTP-01, requires a real domain pointing here
+# internal — self-signed via Caddy's local CA, no domain required
+caddy_tls_mode: auto
+caddy_admin_port: 2019
+# `caddy reload` talks to the admin API over loopback *inside the container*,
+# so the API never has to be reachable from the host. Turning this on binds the
+# admin API to 0.0.0.0 inside the container and publishes it on host loopback.
+caddy_publish_admin: false
+caddy_admin_bind: "{{ '0.0.0.0' if caddy_publish_admin | bool else '127.0.0.1' }}"
+
+# --- Operational knobs -------------------------------------------------------
+caddy_backup_ttl: 5
+caddy_health_timeout: 60
+
+# Ownership of everything this role writes. root is correct for a production
+# run; the local lab overrides both with the current user so it can run without
+# sudo.
+caddy_owner: root
+caddy_group: root
+
+# Drop all Linux capabilities and grant only NET_BIND_SERVICE. Worth keeping in
+# production. The local lab turns it off: the container's root then has no
+# CAP_DAC_OVERRIDE and cannot write into the lab directories, which are owned by
+# an unprivileged user.
+caddy_hardened_caps: true
+
+# Format string for `docker inspect`, used by playbooks/status.yml. The braces
+# are written as quoted literals so Ansible renders them rather than evaluating
+# them, and the whole string is folded to keep it on one line.
+caddy_inspect_format: >-
+  {{ '{{.State.Status}}' }} health={{ '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' }}
+
+# --- Route snippet to apply (empty = skip) -----------------------------------
+# Either point at a ready-made file:
+caddy_route_src: ""
+# ...or let the role render one from variables (this is where caddy_tls_mode
+# takes effect):
+caddy_route_name: ""
+caddy_site: ""
+caddy_routes: []
+#   caddy_routes:
+#     - name: api
+#       paths: ["/api/*", "/health/*"]
+#       upstream: "app:8080"

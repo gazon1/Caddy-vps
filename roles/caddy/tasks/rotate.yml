@@ -1,0 +1,35 @@
+---
+# Keep the newest caddy_backup_ttl copies of a snippet's history and drop the
+# rest, so conf.d/ cannot grow without bound.
+
+- name: Rotate route snippet backups
+  when: caddy_route_name | length > 0
+  block:
+
+    - name: Find existing backups of this snippet
+      ansible.builtin.find:
+        paths: "{{ caddy_conf_d }}"
+        patterns: "{{ caddy_route_name }}.caddy.bak.*"
+        file_type: file
+        recurse: false
+      register: caddy_snippet_backups
+
+    - name: Count the backups found
+      ansible.builtin.set_fact:
+        caddy_backup_total: "{{ caddy_snippet_backups.files | length | int }}"
+        caddy_backups_to_drop: >-
+          {{ [(caddy_snippet_backups.files | length | int) - (caddy_backup_ttl | int), 0] | max }}
+
+    - name: Select the backups that fall outside the retention limit
+      ansible.builtin.set_fact:
+        caddy_stale_backups: >-
+          {{ (caddy_snippet_backups.files | sort(attribute='mtime')
+              | map(attribute='path') | list)[: caddy_backups_to_drop | int] }}
+
+    - name: Remove backups beyond the retention limit
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ caddy_stale_backups }}"
+      loop_control:
+        label: "{{ item | basename }}"

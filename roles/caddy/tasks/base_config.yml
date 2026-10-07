@@ -1,0 +1,24 @@
+---
+# Both files are rendered from templates with backup: true, which means a
+# timestamped .bak is written only when the content actually changes. That keeps
+# the run idempotent instead of littering backups on every invocation.
+
+- name: Install the canonical Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_base }}/Caddyfile"
+    owner: "{{ caddy_owner }}"
+    group: "{{ caddy_group }}"
+    mode: "0644"
+    backup: true
+  notify: Reload Caddy
+
+- name: Install the Caddy compose manifest
+  ansible.builtin.template:
+    src: docker-compose.caddy.yml.j2
+    dest: "{{ caddy_compose_file }}"
+    owner: "{{ caddy_owner }}"
+    group: "{{ caddy_group }}"
+    mode: "0644"
+    backup: true
+  notify: Restart Caddy

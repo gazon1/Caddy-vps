@@ -1,0 +1,9 @@
+---
+# Projects join this network so the proxy can reach them by compose service
+# name (app:8080, frontend:3000, ...) without publishing anything to the host.
+
+- name: Ensure the shared Caddy network exists
+  community.docker.docker_network:
+    name: "{{ caddy_network }}"
+    driver: bridge
+    state: present

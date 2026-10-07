@@ -1,0 +1,90 @@
+---
+# Read-only inspection. Nothing here changes the host — safe to run any time.
+#   just status
+
+- name: Inspect the global Caddy proxy
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+
+  roles:
+    - role: caddy
+      tags:
+        - caddy_status
+
+  tasks:
+    - name: Show where this host is configured
+      ansible.builtin.debug:
+        msg:
+          - "base directory : {{ caddy_base }}"
+          - "snippets       : {{ caddy_conf_d }}"
+          - "container      : {{ caddy_container }}"
+          - "network        : {{ caddy_network }}"
+          - "TLS mode       : {{ caddy_tls_mode }}"
+          - "host ports     : {{ caddy_http_port }}/{{ caddy_https_port }}"
+
+    - name: Check the container state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ caddy_inspect_format }}"
+          - "{{ caddy_container }}"
+      register: caddy_status_container
+      changed_when: false
+
+    - name: Report the container state
+      ansible.builtin.debug:
+        msg: "container: {{ caddy_status_container.stdout | trim }}"
+
+    - name: Validate the running configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - caddy
+          - validate
+          - --config
+          - /etc/caddy/Caddyfile
+      register: caddy_status_validate
+      changed_when: false
+      failed_when: false
+
+    - name: Report the validation result
+      ansible.builtin.debug:
+        msg: >-
+          configuration is {{ 'VALID' if caddy_status_validate.rc == 0
+          else 'INVALID — ' + (caddy_status_validate.stderr | default('') | trim) }}
+
+    - name: List the installed route snippets
+      ansible.builtin.find:
+        paths: "{{ caddy_conf_d }}"
+        patterns: "*.caddy"
+        file_type: file
+        recurse: false
+      register: caddy_status_snippets
+
+    - name: Report the route snippets
+      ansible.builtin.debug:
+        msg: >-
+          {{ (caddy_status_snippets.files | default([])
+             | map(attribute='path') | map('basename') | list
+             | sort | join(', ')) | default('(none)', true) }}
+
+    - name: Count the third-party modules compiled into Caddy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - caddy
+          - list-modules
+          - --skip-standard
+      register: caddy_status_modules
+      changed_when: false
+      failed_when: false
+
+    - name: Report the module count
+      ansible.builtin.debug:
+        msg: "non-standard modules: {{ (caddy_status_modules.stdout_lines | default([]) | length) }}"

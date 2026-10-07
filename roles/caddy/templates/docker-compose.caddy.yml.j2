@@ -1,0 +1,37 @@
+# Managed by Ansible — roles/caddy/templates/docker-compose.caddy.yml.j2
+# Local edits are overwritten. Change the template instead.
+services:
+  caddy:
+    image: {{ caddy_image }}
+    container_name: {{ caddy_container }}
+    restart: always
+    networks:
+      - {{ caddy_network }}
+    ports:
+      - "{{ caddy_http_port }}:80"
+      - "{{ caddy_https_port }}:443"
+{% if caddy_publish_admin | bool %}
+      - "127.0.0.1:{{ caddy_admin_port }}:{{ caddy_admin_port }}"
+{% endif %}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./conf.d:/etc/caddy/conf.d:ro
+      # data/ holds the ACME certificates. Losing it forces a full reissue and
+      # eats into Let's Encrypt's rate limit. Never prune this.
+      - ./data:/data
+      - ./config:/config
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    {% if caddy_hardened_caps | bool %}
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+{% endif %}
+
+networks:
+  {{ caddy_network }}:
+    external: true
+    name: {{ caddy_network }}

@@ -1,0 +1,19 @@
+---
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    level: warning
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    max-spaces-inside: 1
+  truthy:
+    # Ansible booleans are not always lowercase `true`/`false` (Jinja
+    # expressions, 'yes'/'no'), so do not rewrite values here.
+    check-keys: false
+
+ignore: |
+  .git/
+  /tmp/

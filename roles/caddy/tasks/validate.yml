@@ -1,0 +1,16 @@
+---
+# Hard gate. Nothing is reloaded until the configuration validates, so a broken
+# edit can never take the running proxy down.
+
+- name: Validate the Caddy configuration
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ caddy_container }}"
+      - caddy
+      - validate
+      - --config
+      - /etc/caddy/Caddyfile
+  register: caddy_validate_result
+  changed_when: false

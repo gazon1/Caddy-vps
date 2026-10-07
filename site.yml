@@ -1,0 +1,20 @@
+---
+# Single entry point for provisioning the global Caddy reverse proxy.
+#
+#   just bootstrap                      # full infrastructure run
+#   just route <name> <file>            # apply one route snippet
+#   just status                         # read-only inspection
+#
+# Scope is selected with tags:
+#   --tags caddy_infra   network, directories, Caddyfile, compose, container, validate
+#   --tags caddy_routes  apply a single route snippet with backup + rollback
+#
+# Both tags run when no tag is given.
+
+- name: Provision the global Caddy reverse proxy
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+
+  roles:
+    - role: caddy

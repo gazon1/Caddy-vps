@@ -1,0 +1,35 @@
+---
+# Static checks only. The lab suite needs Docker and a writable /opt, so it is
+# run manually via `just lab-test`, not on every push.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core, ansible-lint and yamllint
+        run: pip install --disable-pip-version-check ansible-core ansible-lint yamllint requests
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Syntax check
+        run: ansible-playbook --syntax-check site.yml playbooks/status.yml
+
+      - name: yamllint
+        run: yamllint .
+
+      - name: ansible-lint
+        run: ansible-lint

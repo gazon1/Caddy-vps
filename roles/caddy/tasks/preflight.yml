@@ -1,0 +1,106 @@
+---
+# Refuse to run against a host that cannot support the proxy, or against a
+# directory that belongs to something else. Everything here fails loudly and
+# early rather than halfway through provisioning.
+
+- name: Check that the Docker CLI is present
+  ansible.builtin.command:
+    argv:
+      - docker
+      - --version
+  register: caddy_docker_version
+  changed_when: false
+
+- name: Check that the Docker Compose v2 plugin is present
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - version
+  register: caddy_compose_version
+  changed_when: false
+
+- name: Check that a TLS mode is configured
+  ansible.builtin.assert:
+    that:
+      - caddy_tls_mode in ['auto', 'internal']
+    fail_msg: >-
+      caddy_tls_mode must be 'auto' or 'internal', got '{{ caddy_tls_mode }}'.
+      'auto' needs a real domain with an A record pointing at this host;
+      'internal' issues self-signed certificates and needs nothing.
+
+- name: Inspect caddy_base
+  ansible.builtin.stat:
+    path: "{{ caddy_base }}"
+  register: caddy_base_stat
+
+- name: List regular files in caddy_base
+  ansible.builtin.find:
+    paths: "{{ caddy_base }}"
+    file_type: file
+    recurse: false
+  register: caddy_base_files
+  when: caddy_base_stat.stat.exists | default(false)
+
+- name: Compute the file names already present in caddy_base
+  ansible.builtin.set_fact:
+    caddy_base_filenames: >-
+      {{ caddy_base_files.files | default([]) | map(attribute='path') | map('basename') | list }}
+  when: caddy_base_stat.stat.exists | default(false)
+
+- name: Refuse to touch a foreign installation
+  ansible.builtin.fail:
+    msg: >-
+      {{ caddy_base }} already contains files and neither Caddyfile nor
+      docker-compose.caddy.yml is among them, so this does not look like an
+      installation managed by this role. Move it aside, or re-run with
+      -e caddy_base=<another path>.
+  when:
+    - caddy_base_stat.stat.exists | default(false)
+    - caddy_base_filenames | default([]) | length > 0
+    - "'Caddyfile' not in caddy_base_filenames"
+    - "'docker-compose.caddy.yml' not in caddy_base_filenames"
+
+- name: Find containers publishing the proxy ports
+  ansible.builtin.command:
+    argv:
+      - docker
+      - ps
+      - "--filter=publish={{ item }}"
+      - "--format={{ '{{.Names}}' }}"
+  register: caddy_port_publishers
+  changed_when: false
+  loop:
+    - "{{ caddy_http_port }}"
+    - "{{ caddy_https_port }}"
+
+- name: Flatten the list of port publishers
+  ansible.builtin.set_fact:
+    caddy_publishers: >-
+      {{ caddy_port_publishers.results | map(attribute='stdout_lines') | flatten | list }}
+
+- name: Refuse to start if a foreign container already owns the proxy ports
+  ansible.builtin.assert:
+    that:
+      - caddy_publishers | difference([caddy_container]) | length == 0
+    fail_msg: >-
+      Host ports {{ caddy_http_port }} and {{ caddy_https_port }} are already
+      published by {{ caddy_publishers | difference([caddy_container]) | join(', ') }}.
+      Stop that container first, or override caddy_http_port/caddy_https_port.
+
+- name: Check whether socket inspection is available for port diagnostics
+  ansible.builtin.command:
+    argv:
+      - ss
+      - -ltn
+  register: caddy_socket_listeners
+  changed_when: false
+  failed_when: false
+
+- name: Warn when socket inspection is unavailable
+  ansible.builtin.debug:
+    msg: >-
+      'ss' is not available on this host, so ports were only checked through
+      running containers. A non-Docker process holding {{ caddy_http_port }}
+      would not be detected here and would surface later as a failed bind.
+  when: caddy_socket_listeners.failed | default(false)

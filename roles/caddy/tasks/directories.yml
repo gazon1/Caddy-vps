@@ -1,0 +1,16 @@
+---
+# data/ holds ACME certificates and MUST never be deleted or recreated.
+# config/ holds Caddy's runtime state.
+
+- name: Ensure the Caddy directory structure exists
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ caddy_owner }}"
+    group: "{{ caddy_group }}"
+    mode: "0755"
+  loop:
+    - "{{ caddy_base }}"
+    - "{{ caddy_conf_d }}"
+    - "{{ caddy_base }}/data"
+    - "{{ caddy_base }}/config"

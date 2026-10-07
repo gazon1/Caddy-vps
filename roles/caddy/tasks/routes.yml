@@ -1,0 +1,180 @@
+---
+# Applies ONE route snippet. Two ways to describe the snippet:
+#
+#   1. a ready-made file:  -e caddy_route_name=wb -e caddy_route_src=./site.caddy
+#   2. rendered variables: -e caddy_route_name=wb -e caddy_site=wb.example.com \
+#                          -e caddy_routes='[{"name":"api","paths":["/api/*"],
+#                            "upstream":"app:8080"}]'
+#
+# Both paths converge on the same safety behaviour: back up, apply, validate,
+# and roll back if validation fails. The running proxy is never left with a
+# configuration that Caddy cannot load.
+
+- name: Apply a route snippet
+  when: caddy_route_name | length > 0
+  block:
+
+    - name: Validate the route snippet name
+      ansible.builtin.assert:
+        that:
+          - caddy_route_name is match('^[a-z0-9][a-z0-9-]*$')
+        fail_msg: >-
+          caddy_route_name must match ^[a-z0-9][a-z0-9-]*$ (lowercase letters,
+          digits and dashes) so it cannot escape conf.d. Got
+          '{{ caddy_route_name }}'.
+
+    - name: Require a snippet source or a site definition
+      ansible.builtin.assert:
+        that:
+          - caddy_route_src | length > 0 or (caddy_site | length > 0 and caddy_routes | length > 0)
+        fail_msg: >-
+          Nothing to apply: either set caddy_route_src to a file, or set
+          caddy_site together with a non-empty caddy_routes list.
+
+    # A JSON list passed with -e arrives as a plain STRING, not as a list of
+    # mappings. Parsing it back turns it into the structure route.j2 expects, so
+    # the documented one-liner works as written.
+    - name: Normalise the route list into mappings
+      ansible.builtin.set_fact:
+        caddy_routes_normalised: >-
+          {{ caddy_routes | from_json if caddy_routes is string else caddy_routes }}
+
+    - name: Check that the source snippet exists
+      ansible.builtin.stat:
+        path: "{{ caddy_route_src }}"
+      register: caddy_route_src_stat
+      when: caddy_route_src | length > 0
+
+    - name: Fail when the source snippet is missing
+      ansible.builtin.fail:
+        msg: "Route snippet source not found: {{ caddy_route_src }}"
+      when:
+        - caddy_route_src | length > 0
+        - not caddy_route_src_stat.stat.exists
+
+    - name: Verify the proxy container is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ '{{.State.Running}}' }}"
+          - "{{ caddy_container }}"
+      register: caddy_container_state
+      changed_when: false
+      failed_when: caddy_container_state.rc != 0 or caddy_container_state.stdout != 'true'
+
+    - name: Remember whether a previous version of this snippet exists
+      ansible.builtin.stat:
+        path: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
+      register: caddy_snippet_current
+
+    # Backups are written by hand rather than with `backup: true`, because
+    # Ansible names those <file>.<pid>.<date>@<time>~ which the rotation in
+    # rotate.yml (and every operator's `ls`) would not recognise.
+    - name: Compute the backup path for this apply
+      ansible.builtin.set_fact:
+        caddy_backup_path: >-
+          {{ caddy_conf_d }}/{{ caddy_route_name }}.caddy.bak.{{ ansible_date_time.epoch }}
+
+    - name: Keep the previous version as a backup
+      ansible.builtin.copy:
+        src: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
+        dest: "{{ caddy_backup_path }}"
+        remote_src: true
+        owner: "{{ caddy_owner }}"
+        group: "{{ caddy_group }}"
+        mode: "0644"
+      when: caddy_snippet_current.stat.exists
+
+    - name: Apply and validate
+      block:
+
+        - name: Install the snippet from a file
+          ansible.builtin.copy:
+            src: "{{ caddy_route_src }}"
+            dest: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
+            owner: "{{ caddy_owner }}"
+            group: "{{ caddy_group }}"
+            mode: "0644"
+          register: caddy_apply_from_file
+          when: caddy_route_src | length > 0
+          notify: Reload Caddy
+
+        - name: Render the snippet from variables
+          ansible.builtin.template:
+            src: route.j2
+            dest: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
+            owner: "{{ caddy_owner }}"
+            group: "{{ caddy_group }}"
+            mode: "0644"
+          vars:
+            routes: "{{ caddy_routes_normalised }}"
+          register: caddy_apply_rendered
+          when: caddy_route_src | length == 0
+          notify: Reload Caddy
+
+        - name: Validate the configuration with the new snippet in place
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ caddy_container }}"
+              - caddy
+              - validate
+              - --config
+              - /etc/caddy/Caddyfile
+          register: caddy_snippet_validate
+          changed_when: false
+
+      rescue:
+
+        - name: Restore the previous version of this snippet
+          ansible.builtin.copy:
+            src: "{{ caddy_backup_path }}"
+            dest: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
+            remote_src: true
+            owner: "{{ caddy_owner }}"
+            group: "{{ caddy_group }}"
+            mode: "0644"
+          when: caddy_snippet_current.stat.exists
+
+        # A snippet that did not exist before this run must be removed again —
+        # there is no previous version to fall back to. A snippet that DID
+        # exist keeps its restored content even when nothing changed.
+        - name: Remove the newly created snippet
+          ansible.builtin.file:
+            path: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
+            state: absent
+          when: not caddy_snippet_current.stat.exists
+
+        - name: Re-validate after the rollback to tell the two failure cases apart
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ caddy_container }}"
+              - caddy
+              - validate
+              - --config
+              - /etc/caddy/Caddyfile
+          register: caddy_rollback_validate
+          changed_when: false
+          failed_when: false
+
+        - name: Report that this snippet was at fault
+          ansible.builtin.fail:
+            msg: >-
+              Route snippet '{{ caddy_route_name }}' is invalid and has been rolled
+              back to its previous version. The rest of the configuration is fine —
+              the snippet above is what Caddy rejects:
+              {{ caddy_snippet_validate.stderr | default('') | trim }}
+          when: caddy_rollback_validate.rc == 0
+
+        - name: Report that the breakage predates this run
+          ansible.builtin.fail:
+            msg: >-
+              Route snippet '{{ caddy_route_name }}' was applied, but the resulting
+              configuration is invalid AND the rolled-back one fails too. So the
+              breakage predates this run and this snippet is not necessarily to
+              blame. Check the other files in {{ caddy_conf_d }}:
+              {{ caddy_rollback_validate.stderr | default('') | trim }}

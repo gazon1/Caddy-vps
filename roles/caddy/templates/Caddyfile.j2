@@ -1,0 +1,25 @@
+{
+    email {{ caddy_acme_email }}
+    admin {{ caddy_admin_bind }}:{{ caddy_admin_port }}
+    log default {
+        output stdout
+        format json
+        level INFO
+    }
+    storage file_system {
+        root /data
+    }
+    servers {
+        protocols h1 h2 h3
+        timeouts {
+            read_header 10s
+            read_body 30s
+            write 30s
+            idle 120s
+        }
+    }
+}
+
+# Every project gets its own file in this directory. The proxy imports them
+# all, so a project is added by dropping in one snippet and reloading.
+import /etc/caddy/conf.d/*.caddy

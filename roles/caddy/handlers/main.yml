@@ -1,0 +1,28 @@
+---
+# Reload is graceful — existing connections are drained, no dropped requests.
+# It is also what applies a changed Caddyfile or a changed route snippet.
+
+- name: Reload Caddy
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ caddy_container }}"
+      - caddy
+      - reload
+      - --config
+      - /etc/caddy/Caddyfile
+  register: caddy_reload_result
+  changed_when: true
+
+# Only a changed compose manifest needs a new container. Changing the Caddyfile
+# or a route snippet never reaches this handler.
+- name: Restart Caddy
+  community.docker.docker_compose_v2:
+    project_src: "{{ caddy_base }}"
+    files:
+      - "{{ caddy_compose_file | basename }}"
+    state: present
+    wait: true
+    wait_timeout: "{{ caddy_health_timeout }}"
+  changed_when: true

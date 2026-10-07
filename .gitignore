@@ -1,0 +1,15 @@
+# Ansible retry files
+*.retry
+
+# Local lab state — recreated by tests/lab.sh on every run
+/tmp/caddy-lab/
+
+# Secrets. Copy .env.example, fill it in, keep it out of git.
+.env
+*.vault
+
+# Editor / OS noise
+*.swp
+.DS_Store
+.idea/
+.vscode/

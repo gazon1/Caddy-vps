@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  role_name: caddy
+  namespace: gazon1
+  author: gazon1
+  description: >-
+    Provision and maintain a single global Caddy reverse proxy shared by every
+    project on the VPS.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+  galaxy_tags:
+    - caddy
+    - reverseproxy
+    - docker
+    - infrastructure
+
+dependencies: []

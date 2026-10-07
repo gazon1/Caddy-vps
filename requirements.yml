@@ -1,0 +1,10 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+#
+# These collections run on the CONTROL NODE (your machine), not on the VPS.
+#
+# 5.x is required deliberately: earlier releases break against current
+# `requests` with "Not supported URL scheme http+docker".
+collections:
+  - name: community.docker
+    version: ">=5.0.0"
