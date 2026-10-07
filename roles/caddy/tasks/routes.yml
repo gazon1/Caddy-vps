@@ -164,21 +164,32 @@
     # the TLS handshake and tell you nothing.
     # ---------------------------------------------------------------------
 
+    - name: Build the curl arguments for the probe
+      # Built as a list rather than inline in the command, because dropping
+      # entries from a YAML sequence is only reliable through `omit` — and
+      # `omit` needs a literal placeholder, not a conditional value.
+      #
+      # The --resolve flag and its value are two separate entries, NOT one
+      # "--resolve=host:port:addr" string. The joined form reached curl as an
+      # unknown option on the GitHub runner:
+      #   curl: option --resolve=lab.test:8444:127.0.0.1: is unknown
+      # The same curl accepts both spellings from a shell, so this is about
+      # how the argument is handed over, not what curl supports. See #8.
+      ansible.builtin.set_fact:
+        caddy_probe_argv: "{{ caddy_probe_base + caddy_probe_tls + caddy_probe_resolve }}"
+      vars:
+        caddy_probe_base: >-
+          {{ ['curl', '--silent', '--show-error', '--output', '/dev/null',
+              '--write-out', '%{http_code}',
+              '--max-time', caddy_route_timeout | string, caddy_route_url] }}
+        caddy_probe_tls: "{{ ['--insecure'] if caddy_route_insecure | bool else [] }}"
+        caddy_probe_resolve: >-
+          {{ ['--resolve', caddy_route_resolve]
+             if caddy_route_resolve | length > 0 else [] }}
+
     - name: Probe the route end to end
       ansible.builtin.command:
-        argv:
-          - curl
-          - --silent
-          - --show-error
-          - --output
-          - /dev/null
-          - --write-out
-          - "%{http_code}"
-          - --max-time
-          - "{{ caddy_route_timeout }}"
-          - "{{ '--insecure' if caddy_route_insecure | bool else omit }}"
-          - "{{ '--resolve=' + caddy_route_resolve if caddy_route_resolve | length > 0 else omit }}"
-          - "{{ caddy_route_url }}"
+        argv: "{{ caddy_probe_argv }}"
       register: caddy_route_probe
       changed_when: false
       failed_when: false
