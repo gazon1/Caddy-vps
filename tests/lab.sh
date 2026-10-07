@@ -305,6 +305,12 @@ fi
 #
 # caddy_route_timeout is raised from the production default of 10s: this probe
 # is the first request after a reload, on a busy runner. The role keeps 10s.
+#
+# Output is captured rather than discarded: a failure here has twice looked
+# like "the probe is too strict" while the proxy was answering 200, and
+# guessing from the message alone wasted a full diagnosis. PROBE_OUT is
+# printed verbatim when the check fails.
+PROBE_OUT="$(mktemp)"
 if wait_for_proxy 60; then
     if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
         -e "caddy_route_name=lab" \
@@ -312,15 +318,18 @@ if wait_for_proxy 60; then
         -e "caddy_route_url=https://$LAB_SITE:$LAB_HTTPS_PORT/" \
         -e "caddy_route_insecure=true" \
         -e "caddy_route_timeout=30" \
-        -e "caddy_route_resolve=$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" >/dev/null 2>&1; then
+        -e "caddy_route_resolve=$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" >"$PROBE_OUT" 2>&1; then
         pass "the probe passes when the route really works"
     else
         fail "the probe failed on a working route — it is too strict"
         info "proxy answers: $(ask_proxy || echo 000)"
+        info "playbook output:"
+        sed 's/^/    /' "$PROBE_OUT" | tail -25
     fi
 else
     fail "the proxy never became healthy, so the probe could not be tested"
 fi
+rm -f "$PROBE_OUT"
 
 # ==============================================================================
 step "Backup rotation keeps only caddy_backup_ttl copies"
