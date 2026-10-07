@@ -75,6 +75,23 @@ ask_proxy() {
         "https://$LAB_SITE:$LAB_HTTPS_PORT/" -o /dev/null -w '%{http_code}'
 }
 
+# `caddy reload` returns before the new configuration is live, so a request
+# issued immediately afterwards can still be answered by the previous config
+# (or refused while the reload settles). On a fast local machine that window is
+# a few milliseconds and the test passes; on a CI runner it is long enough to
+# fail intermittently — which is exactly what happened on the first run this
+# suite ever did in CI.
+wait_for_proxy() {
+    local deadline=$(( $(date +%s) + ${1:-60} )) code
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        code="$(ask_proxy || echo 000)"
+        [ "$code" = "200" ] && return 0
+        sleep 1
+    done
+    info "proxy did not answer 200 within the window (last code: ${code:-none})"
+    return 1
+}
+
 # ==============================================================================
 echo "▸ Lab values"
 echo "    base      : $LAB_BASE"
@@ -164,9 +181,11 @@ cmp -s "$LAB_SITE_DIR/good.caddy" "$SNIPPET" \
     && pass "the installed snippet is byte-identical to the source" \
     || fail "the installed snippet differs from the source file"
 
-CODE="$(ask_proxy || echo 000)"
-[[ "$CODE" == "200" ]] && pass "proxy answers 200 through the route" \
-    || fail "proxy answered '$CODE' instead of 200"
+if wait_for_proxy 60; then
+    pass "proxy answers 200 through the route"
+else
+    fail "proxy did not answer 200 through the route (last code: $(ask_proxy || echo 000))"
+fi
 
 # ==============================================================================
 step "An invalid snippet is rejected and rolled back"
@@ -199,9 +218,11 @@ else
     fail "the configuration is still invalid after the rollback"
 fi
 
-CODE="$(ask_proxy || echo 000)"
-[[ "$CODE" == "200" ]] && pass "the proxy kept serving the old route throughout" \
-    || fail "the proxy stopped answering after the failed apply (got '$CODE')"
+if wait_for_proxy 60; then
+    pass "the proxy kept serving the old route throughout"
+else
+    fail "the proxy stopped answering after the failed apply (last code: $(ask_proxy || echo 000))"
+fi
 
 # ==============================================================================
 step "A valid snippet pointing at a dead upstream is caught by the probe"
@@ -263,9 +284,11 @@ else
     fail "the configuration was left invalid"
 fi
 
-CODE="$(ask_proxy || echo 000)"
-[[ "$CODE" == "200" ]] && pass "the working route was not disturbed" \
-    || fail "the working route broke (got '$CODE')"
+if wait_for_proxy 60; then
+    pass "the working route was not disturbed"
+else
+    fail "the working route broke (last code: $(ask_proxy || echo 000))"
+fi
 
 # --- Same dead snippet, but no probe configured: must succeed ---
 if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
@@ -277,15 +300,26 @@ else
 fi
 
 # --- The live route, probed: must succeed ---
-if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
-    -e "caddy_route_name=lab" \
-    -e "caddy_route_src=$LAB_SITE_DIR/good.caddy" \
-    -e "caddy_route_url=https://$LAB_SITE:$LAB_HTTPS_PORT/" \
-    -e "caddy_route_insecure=true" \
-    -e "caddy_route_resolve=$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" >/dev/null 2>&1; then
-    pass "the probe passes when the route really works"
+# Wait first: the reload triggered by the apply above is asynchronous, so the
+# probe can fire while Caddy is still serving the previous configuration.
+#
+# caddy_route_timeout is raised from the production default of 10s: this probe
+# is the first request after a reload, on a busy runner. The role keeps 10s.
+if wait_for_proxy 60; then
+    if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
+        -e "caddy_route_name=lab" \
+        -e "caddy_route_src=$LAB_SITE_DIR/good.caddy" \
+        -e "caddy_route_url=https://$LAB_SITE:$LAB_HTTPS_PORT/" \
+        -e "caddy_route_insecure=true" \
+        -e "caddy_route_timeout=30" \
+        -e "caddy_route_resolve=$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" >/dev/null 2>&1; then
+        pass "the probe passes when the route really works"
+    else
+        fail "the probe failed on a working route — it is too strict"
+        info "proxy answers: $(ask_proxy || echo 000)"
+    fi
 else
-    fail "the probe failed on a working route — it is too strict"
+    fail "the proxy never became healthy, so the probe could not be tested"
 fi
 
 # ==============================================================================
