@@ -18,9 +18,6 @@ caddy_https_port: 443
 
 # --- Caddy behaviour ---------------------------------------------------------
 caddy_acme_email: drobin.me@yandex.ru
-# auto     — Let's Encrypt via HTTP-01, requires a real domain pointing here
-# internal — self-signed via Caddy's local CA, no domain required
-caddy_tls_mode: auto
 caddy_admin_port: 2019
 # `caddy reload` talks to the admin API over loopback *inside the container*,
 # so the API never has to be reachable from the host. Turning this on binds the
@@ -31,6 +28,11 @@ caddy_admin_bind: "{{ '0.0.0.0' if caddy_publish_admin | bool else '127.0.0.1' }
 # --- Operational knobs -------------------------------------------------------
 caddy_backup_ttl: 5
 caddy_health_timeout: 60
+
+# Log retention for the proxy. It fronts every project on the host, so its
+# logs are the only record of what it served.
+caddy_log_max_size: 10m
+caddy_log_max_file: 5
 
 # Ownership of everything this role writes. root is correct for a production
 # run; the local lab overrides both with the current user so it can run without
@@ -51,14 +53,26 @@ caddy_inspect_format: >-
   {{ '{{.State.Status}}' }} health={{ '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' }}
 
 # --- Route snippet to apply (empty = skip) -----------------------------------
-# Either point at a ready-made file:
+# A route is always a file. TLS is whatever that file says it should be:
+# omit `tls` for a Let's Encrypt certificate, write `tls internal` for a
+# self-signed one. There is deliberately no global TLS switch — two projects
+# can sit side by side using different modes.
 caddy_route_src: ""
-# ...or let the role render one from variables (this is where caddy_tls_mode
-# takes effect):
 caddy_route_name: ""
-caddy_site: ""
-caddy_routes: []
-#   caddy_routes:
-#     - name: api
-#       paths: ["/api/*", "/health/*"]
-#       upstream: "app:8080"
+
+# --- Optional post-apply reachability probe ----------------------------------
+# `caddy validate` adapts the config; it does not exercise it. A snippet that
+# points at an upstream that does not resolve passes validation and then fails
+# every request. Set caddy_route_url to have the run actually check the route.
+# Empty by default: the application is not always up yet when a route is
+# registered, and a mandatory probe would fail for a reason that has nothing to
+# do with the route being correct.
+caddy_route_url: ""
+caddy_route_timeout: 10
+# Needed when probing a self-signed certificate (a snippet using `tls internal`).
+caddy_route_insecure: false
+# Optional curl --resolve value, e.g. "myproject.test:443:127.0.0.1", for when
+# the site address in caddy_route_url does not resolve from the control node.
+# A Host header is NOT a substitute: Caddy selects the certificate by SNI, so a
+# request whose SNI does not match the site fails during the TLS handshake.
+caddy_route_resolve: ""

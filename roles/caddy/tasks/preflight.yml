@@ -20,15 +20,6 @@
   register: caddy_compose_version
   changed_when: false
 
-- name: Check that a TLS mode is configured
-  ansible.builtin.assert:
-    that:
-      - caddy_tls_mode in ['auto', 'internal']
-    fail_msg: >-
-      caddy_tls_mode must be 'auto' or 'internal', got '{{ caddy_tls_mode }}'.
-      'auto' needs a real domain with an A record pointing at this host;
-      'internal' issues self-signed certificates and needs nothing.
-
 - name: Inspect caddy_base
   ansible.builtin.stat:
     path: "{{ caddy_base }}"

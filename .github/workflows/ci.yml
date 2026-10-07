@@ -33,3 +33,23 @@ jobs:
 
       - name: ansible-lint
         run: ansible-lint
+
+  lab:
+    # The real test. Runs the role against a throwaway proxy on non-standard
+    # ports under /tmp — no VPS involved and ACME is never contacted.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core, ansible-lint, yamllint and requests
+        run: pip install --disable-pip-version-check ansible-core ansible-lint yamllint requests
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Run the lab suite
+        run: bash tests/lab.sh

@@ -20,7 +20,7 @@
           - "snippets       : {{ caddy_conf_d }}"
           - "container      : {{ caddy_container }}"
           - "network        : {{ caddy_network }}"
-          - "TLS mode       : {{ caddy_tls_mode }}"
+
           - "host ports     : {{ caddy_http_port }}/{{ caddy_https_port }}"
 
     - name: Check the container state
@@ -71,6 +71,59 @@
           {{ (caddy_status_snippets.files | default([])
              | map(attribute='path') | map('basename') | list
              | sort | join(', ')) | default('(none)', true) }}
+
+    - name: Locate issued certificates
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - find
+          - /data/caddy/certificates
+          - -name
+          - "*.crt"
+      register: caddy_status_cert_files
+      changed_when: false
+      failed_when: false
+
+    - name: Read certificate expiry dates
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - openssl
+          - x509
+          - -enddate
+          - -noout
+          - -in
+          - "{{ item }}"
+      loop: "{{ caddy_status_cert_files.stdout_lines | default([]) }}"
+      register: caddy_status_cert_expiry
+      changed_when: false
+      failed_when: false
+
+    # Caddy renews certificates on its own, but only while it is running. A
+    # failed renewal is invisible until a browser starts complaining, so it is
+    # worth surfacing the expiry date proactively.
+    - name: Report certificate expiry
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item | regex_replace('^.*/certificates/', '') | regex_replace('/[^/]+$', '') }}
+          → {{ (item.stdout | default('')) | trim | default('expiry unreadable (no openssl in the image)', true) }}
+      loop: "{{ caddy_status_cert_expiry.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') | basename }}"
+      when: item.item is defined
+
+    - name: Warn when no certificate could be read
+      ansible.builtin.debug:
+        msg: >-
+          No certificate expiry could be read. Either no certificate has been
+          issued yet, or the image has no openssl. Certificates normally live
+          under /data/caddy/certificates.
+      when:
+        - (caddy_status_cert_expiry.results | default([]) | length) == 0
 
     - name: Count the third-party modules compiled into Caddy
       ansible.builtin.command:

@@ -3,11 +3,5 @@
 # with -e on the command line. See roles/caddy/defaults/main.yml for the full
 # list of knobs and their meaning.
 #
-# caddy_tls_mode:
-#   auto     — real Let's Encrypt certificates (needs a domain + A record)
-#   internal — self-signed certificates via Caddy's local CA (no domain needed,
-#              browsers show a warning). Used by the local lab.
-
 caddy_acme_email: drobin.me@yandex.ru
-caddy_tls_mode: auto
 caddy_image: caddy:2.8-alpine

@@ -105,14 +105,25 @@ and still fail every request, for example when:
 - `reverse_proxy` points at a port nothing serves
 
 So a successful `just route` means "this configuration is loadable", not "this
-project is now reachable". Always follow it with the end-to-end check:
+project is now reachable".
+
+For that, pass a URL to probe and the run checks it for you:
+
+```bash
+just route myproject deploy/myproject.conf.caddy \
+  -e caddy_route_url=https://myproject.example.com/api/health/live
+```
+
+The probe runs *after* validation and *outside* the rollback logic on
+purpose — an unreachable backend is not a configuration error, so rolling the
+snippet back would hide the real problem behind a misleading message. The
+snippet stays applied and the run fails with an explanation.
+
+Without the probe, do the check by hand:
 
 ```bash
 curl -I https://myproject.example.com/api/health/live
 ```
-
-An unreachable upstream is a routing mistake rather than a configuration
-error, and the safety net does not and cannot catch it for you.
 
 ### Ports 80/443 are in the way
 

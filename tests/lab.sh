@@ -30,7 +30,6 @@ LAB_VARS=(
     -e "caddy_http_port=$LAB_HTTP_PORT"
     -e "caddy_https_port=$LAB_HTTPS_PORT"
     -e "caddy_acme_email=lab@example.invalid"
-    -e "caddy_tls_mode=internal"
     # The lab runs without sudo, so it cannot claim root ownership.
     -e "caddy_owner=$(id -un)"
     -e "caddy_group=$(id -gn)"
@@ -38,7 +37,6 @@ LAB_VARS=(
     -e "caddy_hardened_caps=false"
 )
 
-GOOD_ROUTES='[{"name":"app","paths":["/"],"upstream":"caddy_lab_backend:80"}]'
 
 FAILURES=0
 STEP=0
@@ -140,17 +138,31 @@ docker inspect -f '{{.State.Running}}' "$LAB_BACKEND" 2>/dev/null | grep -q true
     || fail "backend $LAB_BACKEND did not start"
 
 # ==============================================================================
-step "Apply a route snippet rendered from variables"
+step "Apply a route snippet"
+# A route is just a file, and TLS is whatever that file says. `tls internal`
+# here is what lets the lab use a self-signed certificate without touching
+# Let's Encrypt; in production you would leave it out.
+cat > "$LAB_SITE_DIR/good.caddy" <<EOF
+$LAB_SITE {
+    tls internal
+    encode zstd gzip
+    @app path /
+    reverse_proxy @app $LAB_BACKEND:80
+}
+EOF
+
 play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
     -e "caddy_route_name=lab" \
-    -e "caddy_site=$LAB_SITE" \
-    -e "caddy_routes=$GOOD_ROUTES" >/dev/null
+    -e "caddy_route_src=$LAB_SITE_DIR/good.caddy" >/dev/null
 
 SNIPPET="$LAB_BASE/conf.d/lab.caddy"
 [[ -f "$SNIPPET" ]] && pass "snippet written to $SNIPPET" || fail "snippet was not written"
 grep -q 'tls internal' "$SNIPPET" \
-    && pass "caddy_tls_mode=internal injected the tls directive" \
-    || fail "tls internal directive missing from the rendered snippet"
+    && pass "the snippet's own tls directive survived the copy" \
+    || fail "tls internal directive missing from the installed snippet"
+cmp -s "$LAB_SITE_DIR/good.caddy" "$SNIPPET" \
+    && pass "the installed snippet is byte-identical to the source" \
+    || fail "the installed snippet differs from the source file"
 
 CODE="$(ask_proxy || echo 000)"
 [[ "$CODE" == "200" ]] && pass "proxy answers 200 through the route" \
@@ -159,11 +171,10 @@ CODE="$(ask_proxy || echo 000)"
 # ==============================================================================
 step "An invalid snippet is rejected and rolled back"
 BEFORE="$(cat "$SNIPPET")"
-cp "$SNIPPET" "$LAB_SITE_DIR/good.caddy"
 # An UNKNOWN DIRECTIVE is the right kind of broken on purpose: `caddy validate`
 # adapts the configuration, so this fails at validation time. A snippet that is
 # syntactically fine but points at a dead upstream would pass validation and
-# only break at request time — see the caveat in docs/RUNBOOK.md.
+# only break at request time — that case is covered further down.
 cat > "$LAB_SITE_DIR/broken.caddy" <<'EOF'
 lab.test {
     this_directive_does_not_exist
@@ -191,6 +202,91 @@ fi
 CODE="$(ask_proxy || echo 000)"
 [[ "$CODE" == "200" ]] && pass "the proxy kept serving the old route throughout" \
     || fail "the proxy stopped answering after the failed apply (got '$CODE')"
+
+# ==============================================================================
+step "A valid snippet pointing at a dead upstream is caught by the probe"
+# This is the gap validation cannot close: the configuration loads fine, and
+# only a real request reveals that nothing is listening. caddy_route_url is
+# what turns that from a mystery into a failed run.
+cat > "$LAB_SITE_DIR/dead.caddy" <<EOF
+dead.$LAB_SITE {
+    tls internal
+    reverse_proxy nothing-is-listening-here:80
+}
+EOF
+
+# A distinct hostname on purpose: two snippets claiming the same site address
+# would make Caddy reject the config outright, and the run would then fail for
+# the wrong reason — which is exactly what an earlier version of this test did.
+DEAD_SITE="dead.$LAB_SITE"
+DEAD_URL="https://$DEAD_SITE:$LAB_HTTPS_PORT/"
+DEAD_RESOLVE="$DEAD_SITE:$LAB_HTTPS_PORT:127.0.0.1"
+DEAD_OUT="$(mktemp)"
+
+if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
+    -e "caddy_route_name=dead" \
+    -e "caddy_route_src=$LAB_SITE_DIR/dead.caddy" \
+    -e "caddy_route_url=$DEAD_URL" \
+    -e "caddy_route_insecure=true" \
+    -e "caddy_route_resolve=$DEAD_RESOLVE" >"$DEAD_OUT" 2>&1; then
+    fail "the run succeeded even though the route could not answer"
+else
+    pass "the run failed on an unreachable upstream"
+fi
+
+if grep -q 'did not answer' "$DEAD_OUT"; then
+    pass "the failure says the route did not answer"
+else
+    fail "the failure did not explain that the route was unreachable"
+fi
+
+if grep -q 'NOT been rolled back' "$DEAD_OUT"; then
+    pass "the failure says the snippet was kept, not rolled back"
+else
+    fail "the failure left the operator guessing about rollback"
+fi
+
+# The probe must not be mistaken for a validation failure: Caddy accepted this
+# configuration, it simply has nothing to forward to.
+if grep -q 'ambiguous site definition' "$DEAD_OUT"; then
+    fail "the snippet was rejected by Caddy — the test is measuring the wrong thing"
+else
+    pass "the configuration itself was accepted by Caddy"
+fi
+rm -f "$DEAD_OUT"
+
+# The good route must still be untouched — a probe failure is not a
+# configuration failure, so nothing may be rolled back.
+if docker exec "$LAB_CONTAINER" caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    pass "the proxy is still in a valid state after the probe failed"
+else
+    fail "the configuration was left invalid"
+fi
+
+CODE="$(ask_proxy || echo 000)"
+[[ "$CODE" == "200" ]] && pass "the working route was not disturbed" \
+    || fail "the working route broke (got '$CODE')"
+
+# --- Same dead snippet, but no probe configured: must succeed ---
+if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
+    -e "caddy_route_name=dead" \
+    -e "caddy_route_src=$LAB_SITE_DIR/dead.caddy" >/dev/null 2>&1; then
+    pass "without caddy_route_url the dead upstream is not detected (opt-in works)"
+else
+    fail "the probe ran even though no URL was configured"
+fi
+
+# --- The live route, probed: must succeed ---
+if play "$REPO_ROOT/site.yml" --tags caddy_routes "${LAB_VARS[@]}" \
+    -e "caddy_route_name=lab" \
+    -e "caddy_route_src=$LAB_SITE_DIR/good.caddy" \
+    -e "caddy_route_url=https://$LAB_SITE:$LAB_HTTPS_PORT/" \
+    -e "caddy_route_insecure=true" \
+    -e "caddy_route_resolve=$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" >/dev/null 2>&1; then
+    pass "the probe passes when the route really works"
+else
+    fail "the probe failed on a working route — it is too strict"
+fi
 
 # ==============================================================================
 step "Backup rotation keeps only caddy_backup_ttl copies"

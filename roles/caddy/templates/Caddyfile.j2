@@ -1,6 +1,19 @@
 {
+    # The ACME account for automatic certificate issuance and expiry notices.
     email {{ caddy_acme_email }}
+
+    # The admin API. `caddy reload` talks to it, which is why it is configured
+    # at all — do not remove it without replacing the reload strategy.
+    #
+    # It binds to the container's loopback interface, and every command that
+    # uses it runs through `docker exec`, so it is reachable exactly where it
+    # needs to be and nowhere else. Publishing this port to the host
+    # (caddy_publish_admin) is an opt-in debugging convenience: the host-side
+    # mapping only forwards to the container's interfaces, never to the
+    # loopback address bound here, which is why the two settings are tied
+    # together in roles/caddy/defaults/main.yml.
     admin {{ caddy_admin_bind }}:{{ caddy_admin_port }}
+
     log default {
         output stdout
         format json

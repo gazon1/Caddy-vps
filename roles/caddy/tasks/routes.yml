@@ -1,14 +1,12 @@
 ---
-# Applies ONE route snippet. Two ways to describe the snippet:
+# Applies ONE route snippet from a file:
 #
-#   1. a ready-made file:  -e caddy_route_name=wb -e caddy_route_src=./site.caddy
-#   2. rendered variables: -e caddy_route_name=wb -e caddy_site=wb.example.com \
-#                          -e caddy_routes='[{"name":"api","paths":["/api/*"],
-#                            "upstream":"app:8080"}]'
+#   -e caddy_route_name=wb -e caddy_route_src=./site.caddy
 #
-# Both paths converge on the same safety behaviour: back up, apply, validate,
-# and roll back if validation fails. The running proxy is never left with a
-# configuration that Caddy cannot load.
+# The snippet is an ordinary Caddyfile fragment, so TLS is whatever the
+# snippet says it should be: omit `tls` for a Let's Encrypt certificate, or
+# write `tls internal` for a self-signed one. Nothing is injected behind your
+# back, and two projects can use different TLS modes side by side.
 
 - name: Apply a route snippet
   when: caddy_route_name | length > 0
@@ -23,34 +21,22 @@
           digits and dashes) so it cannot escape conf.d. Got
           '{{ caddy_route_name }}'.
 
-    - name: Require a snippet source or a site definition
+    - name: Require a snippet source
       ansible.builtin.assert:
         that:
-          - caddy_route_src | length > 0 or (caddy_site | length > 0 and caddy_routes | length > 0)
+          - caddy_route_src | length > 0
         fail_msg: >-
-          Nothing to apply: either set caddy_route_src to a file, or set
-          caddy_site together with a non-empty caddy_routes list.
-
-    # A JSON list passed with -e arrives as a plain STRING, not as a list of
-    # mappings. Parsing it back turns it into the structure route.j2 expects, so
-    # the documented one-liner works as written.
-    - name: Normalise the route list into mappings
-      ansible.builtin.set_fact:
-        caddy_routes_normalised: >-
-          {{ caddy_routes | from_json if caddy_routes is string else caddy_routes }}
+          Nothing to apply: set caddy_route_src to a Caddyfile fragment.
 
     - name: Check that the source snippet exists
       ansible.builtin.stat:
         path: "{{ caddy_route_src }}"
       register: caddy_route_src_stat
-      when: caddy_route_src | length > 0
 
     - name: Fail when the source snippet is missing
       ansible.builtin.fail:
         msg: "Route snippet source not found: {{ caddy_route_src }}"
-      when:
-        - caddy_route_src | length > 0
-        - not caddy_route_src_stat.stat.exists
+      when: not caddy_route_src_stat.stat.exists
 
     - name: Verify the proxy container is running
       ansible.builtin.command:
@@ -89,28 +75,13 @@
     - name: Apply and validate
       block:
 
-        - name: Install the snippet from a file
+        - name: Install the snippet
           ansible.builtin.copy:
             src: "{{ caddy_route_src }}"
             dest: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
             owner: "{{ caddy_owner }}"
             group: "{{ caddy_group }}"
             mode: "0644"
-          register: caddy_apply_from_file
-          when: caddy_route_src | length > 0
-          notify: Reload Caddy
-
-        - name: Render the snippet from variables
-          ansible.builtin.template:
-            src: route.j2
-            dest: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
-            owner: "{{ caddy_owner }}"
-            group: "{{ caddy_group }}"
-            mode: "0644"
-          vars:
-            routes: "{{ caddy_routes_normalised }}"
-          register: caddy_apply_rendered
-          when: caddy_route_src | length == 0
           notify: Reload Caddy
 
         - name: Validate the configuration with the new snippet in place
@@ -178,3 +149,65 @@
               breakage predates this run and this snippet is not necessarily to
               blame. Check the other files in {{ caddy_conf_d }}:
               {{ caddy_rollback_validate.stderr | default('') | trim }}
+
+    # ---------------------------------------------------------------------
+    # Reachability probe — deliberately OUTSIDE the block/rescue above.
+    #
+    # Validation proves the configuration can be loaded; it says nothing about
+    # whether the upstream exists. If that check lived inside the block, an
+    # unreachable backend would trigger a rollback of a perfectly good snippet
+    # and hide the actual problem behind a misleading "rolled back" message.
+    #
+    # curl rather than uri: curl can be told how to resolve an address
+    # (--resolve), which also sets SNI correctly. A Host header alone is not
+    # enough — Caddy picks the certificate by SNI, so the request would die in
+    # the TLS handshake and tell you nothing.
+    # ---------------------------------------------------------------------
+
+    - name: Probe the route end to end
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - --max-time
+          - "{{ caddy_route_timeout }}"
+          - "{{ '--insecure' if caddy_route_insecure | bool else omit }}"
+          - "{{ '--resolve=' + caddy_route_resolve if caddy_route_resolve | length > 0 else omit }}"
+          - "{{ caddy_route_url }}"
+      register: caddy_route_probe
+      changed_when: false
+      failed_when: false
+      when: caddy_route_url | length > 0
+
+    # 2xx/3xx/4xx all mean the application answered, so routing works. curl
+    # prints 000 when it never got a response at all — a dead TLS handshake, a
+    # refused connection or a DNS failure all look like this.
+    - name: Work out whether the route answered
+      ansible.builtin.set_fact:
+        caddy_route_status: "{{ caddy_route_probe.stdout | default('000') | trim }}"
+      when: caddy_route_url | length > 0
+
+    - name: Report an unreachable route
+      ansible.builtin.fail:
+        msg: >-
+          The configuration was applied and validates, but {{ caddy_route_url }}
+          did not answer — HTTP {{ caddy_route_status }}
+          {{ '(' + probe_detail + ')' if probe_detail | default('') | length > 0 else '' }}.
+          Caddy cannot load a broken configuration, but it will happily forward
+          to an upstream that does not exist — that is the one class of mistake
+          validation cannot catch. Check that the application container is
+          running and is attached to the {{ caddy_network }} network under the
+          exact name used in the snippet. If the request never reached Caddy at
+          all, check DNS and the TLS handshake instead. The snippet has NOT been
+          rolled back.
+      vars:
+        probe_detail: >-
+          {{ caddy_route_probe.stderr | default('') | trim }}
+      when:
+        - caddy_route_url | length > 0
+        - caddy_route_status | int < 200 or caddy_route_status | int >= 500

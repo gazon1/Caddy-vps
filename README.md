@@ -85,13 +85,23 @@ The snippet is backed up, validated, and only then reloaded. If Caddy rejects
 it, the previous version is restored and the run fails loudly — the proxy
 never ends up holding a config it cannot load.
 
-If you prefer Ansible variables to a file:
+Validation only proves the configuration *loads*. It cannot tell you the
+upstream exists, so add a reachability probe when you want that checked too:
 
 ```bash
-ansible-playbook site.yml --tags caddy_routes \
-  -e caddy_route_name=myproject -e caddy_site=myproject.example.com \
-  -e caddy_routes='[{"name":"api","paths":["/api/*"],"upstream":"app:8080"}]'
+just route myproject deploy/myproject.conf.caddy \
+  -e caddy_route_url=https://myproject.example.com/api/health/live
 ```
+
+The run now also makes a real request and fails if the route does not answer.
+It is opt-in because the application is not always up yet at the moment a
+route is registered, and a mandatory probe would fail for reasons that have
+nothing to do with the route being correct.
+
+A route is always a file — there is no second way to describe one. TLS belongs
+to that file too: leave `tls` out for a Let's Encrypt certificate, or write
+`tls internal` for a self-signed one. Nothing global forces one mode on every
+project, so a site without a domain can sit next to one that has it.
 
 ## Commands
 
@@ -117,16 +127,19 @@ per host in `inventory/group_vars/vps.yml` or on the command line with `-e`.
 | `caddy_http_port` / `caddy_https_port` | `80` / `443` | **host** ports |
 | `caddy_image` | `caddy:2.8-alpine` | pinned on purpose — floating tags make deploys unreproducible |
 | `caddy_acme_email` | — | Let's Encrypt account address |
-| `caddy_tls_mode` | `auto` | `auto` = real certificates; `internal` = self-signed, no domain needed |
 | `caddy_backup_ttl` | `5` | snippet backups kept per snippet |
 | `caddy_publish_admin` | `false` | expose the admin API on host loopback for debugging |
+| `caddy_route_url` | *(empty)* | after applying a route, request this URL and fail if it does not answer |
+| `caddy_log_max_size` / `caddy_log_max_file` | `10m` / `5` | proxy log retention |
 
 ## Certificates
 
-`caddy_tls_mode: auto` issues real Let's Encrypt certificates over HTTP-01, so
-the site address must be a real domain with an A record pointing at the
-server. `internal` issues a self-signed certificate instead — useful for
-testing or when there is no domain yet, but browsers will warn.
+TLS is chosen per snippet, not globally. A site block with no `tls` directive
+gets a real Let's Encrypt certificate over HTTP-01, so its address must be a
+real domain with an A record pointing at the server. Adding `tls internal`
+gives that one snippet a self-signed certificate instead — useful for testing
+or when there is no domain yet, but browsers will warn. Both kinds can be
+served by the same proxy at the same time.
 
 Certificates live in `/opt/caddy/data`. **That directory must never be
 deleted or pruned.** Losing it forces every certificate to be reissued and
