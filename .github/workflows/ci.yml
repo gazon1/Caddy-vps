@@ -1,13 +1,21 @@
 ---
-# Static checks only. The lab suite needs Docker and a writable /opt, so it is
-# run manually via `just lab-test`, not on every push.
+# Two jobs: static checks (lint + syntax) and the lab suite, which exercises
+# the role against a throwaway proxy in Docker.
+#
+# The lab runs here on every push — see the `lab:` job below. It needs no VPS,
+# never contacts ACME, and works on non-standard ports under /tmp, so there is
+# nothing to be gained by making it manual.
+#
+# (An earlier version of this comment claimed the lab was manual-only while a
+# `lab:` job already ran it, which is how the workflow sat broken on a deleted
+# branch for as long as it did.)
 name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 jobs:
   lint:

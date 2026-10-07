@@ -81,7 +81,8 @@
 
     - name: Fail when the certificate store cannot be read at all
       ansible.builtin.fail:
-        msg: "{{ ['Cannot reach the certificate store inside the proxy container (exit ' ~ (cert_storage.rc | default('?')) ~ ').',
+        msg: "{{ ['Cannot reach the certificate store inside the proxy container (exit '
+                    ~ (cert_storage.rc | default('?')) ~ ').',
                     'Either the proxy is not running, or it is running without its storage mounted.',
                     'Check: docker exec ' ~ caddy_container ~ ' ls -la /data/caddy'] | join(' ') }}"
       when: cert_storage.rc != 0
@@ -192,7 +193,8 @@
         msg: "{{ ['Could not read the expiry of ' ~ (cert_unreadable | length) ~ ' certificate(s).',
                     'A certificate that cannot be parsed must not count as healthy, because an unreadable',
                     'expiry is exactly what a silently failed renewal looks like. Check by hand:',
-                    'docker exec ' ~ caddy_container ~ ' cat <path-to-crt> | openssl x509 -enddate -noout'] | join(' ') }}"
+                    'docker exec ' ~ caddy_container ~ ' cat <path-to-crt> | openssl x509 -enddate -noout'
+                   ] | join(' ') }}"
       vars:
         cert_unreadable: >-
           {{ cert_expiry.results | default([])

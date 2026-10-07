@@ -408,6 +408,22 @@ else
 fi
 
 # ==============================================================================
+step "no leftover directories from the bash pipeline"
+# caddy.bootstrap/, lib/ and scripts/ survived the bash→Ansible rewrite as
+# empty shells. Git does not track empty directories, so they never reached a
+# fresh clone — but they were still on disk, and `caddy.bootstrap/` reads like
+# "the bootstrap config lives here", sending anyone looking for
+# roles/caddy/templates/ in the wrong direction.
+step_dirty="$(find "$REPO_ROOT" -maxdepth 1 -type d -empty \
+    -not -name '.' -not -name '.git' -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')"
+
+if [[ -z "${step_dirty// /}" ]]; then
+    pass "no empty top-level directories"
+else
+    fail "empty directories left over: ${step_dirty}(remove them: rmdir ${step_dirty})"
+fi
+
+# ==============================================================================
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     printf '\033[0;32m✅ Lab suite passed\033[0m\n'
