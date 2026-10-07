@@ -4,4 +4,16 @@
 # list of knobs and their meaning.
 #
 caddy_acme_email: drobin.me@yandex.ru
-caddy_image: caddy:2.8-alpine
+
+# Pinned, not the floating `caddy:2-alpine` this host was originally created
+# with. The floating tag meant a `docker compose pull` could silently move the
+# proxy several minor versions under you; an exact tag makes every change to
+# the proxy an explicit edit of this file.
+#
+# This is 2.11.7 because the host was ALREADY on 2.11.4 — the role default of
+# 2.8-alpine would have been a three-version downgrade of a working proxy.
+# Verify with: docker exec caddy_global caddy version
+#
+# Note: this image ships without openssl (checked on both 2.8 and 2.11.7).
+# `playbooks/cert-check.yml` parses certificates with Python for that reason.
+caddy_image: caddy:2.11.7-alpine

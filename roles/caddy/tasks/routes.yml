@@ -28,15 +28,30 @@
         fail_msg: >-
           Nothing to apply: set caddy_route_src to a Caddyfile fragment.
 
-    - name: Check that the source snippet exists
-      ansible.builtin.stat:
-        path: "{{ caddy_route_src }}"
-      register: caddy_route_src_stat
+    # caddy_route_src is a path on the CONTROL node, not on the target: the
+    # "Install the snippet" copy below reads it from there. Checking it on the
+    # managed host looks like it works and does not — the lab suite connects
+    # with ansible_connection: local, so both sides are the same machine and
+    # the distinction is invisible there. On a real host this fails with
+    # "Route snippet source not found" for a file that is right there.
+    #
+    # A lookup rather than a delegated stat: delegate_to inherits the host's
+    # become, and `-e ansible_become=true` (which is how this host is reached)
+    # outranks a task-level `become: false`, so the delegated stat asks sudo
+    # for a password on the control node. The lookup runs locally, needs no
+    # privileges and cannot be redirected to the wrong machine.
+    - name: Check that the source snippet exists on the control node
+      ansible.builtin.set_fact:
+        caddy_route_src_readable: >-
+          {{ lookup('ansible.builtin.file', caddy_route_src, errors='ignore')
+             | length > 0 }}
 
     - name: Fail when the source snippet is missing
       ansible.builtin.fail:
-        msg: "Route snippet source not found: {{ caddy_route_src }}"
-      when: not caddy_route_src_stat.stat.exists
+        msg: >-
+          Route snippet source not readable on the control node:
+          {{ caddy_route_src }}
+      when: not caddy_route_src_readable | bool
 
     - name: Verify the proxy container is running
       ansible.builtin.command:

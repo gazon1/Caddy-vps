@@ -59,6 +59,11 @@ info() { printf '\033[0;36m  → %s\033[0m\n' "$1"; }
 # harmless: the next run reuses it, and preflight accepts it because this
 # role's own Caddyfile is already sitting there.
 teardown() {
+    # Certificates planted by the lab are written by root inside the container,
+    # so they survive as long as /data does — and cert-check.yml scans all of
+    # /data. Clear them before the container goes, or the next run starts with
+    # a store that is not empty and T9 measures the wrong thing.
+    docker exec "$LAB_CONTAINER" sh -c 'rm -rf /data/certificates/* /data/caddy/certificates/*' >/dev/null 2>&1 || true
     docker rm -f "$LAB_CONTAINER" "$LAB_BACKEND" >/dev/null 2>&1 || true
     docker network rm "$LAB_NETWORK" >/dev/null 2>&1 || true
     rm -rf "$LAB_BASE" >/dev/null 2>&1 || true
@@ -372,6 +377,15 @@ step "playbooks/cert-check.yml is read-only and passes with no certificates"
 # The lab proxy never talks to ACME, so its certificate store is empty. That is
 # itself worth asserting: a monitoring job that runs nightly must not fail, and
 # must not touch anything, before any certificate exists.
+#
+# Emptied first, from inside the container. /data is a bind mount that survives
+# between runs, and certificates planted by an earlier step stay there as root,
+# which the unprivileged lab user cannot delete from the host. cert-check.yml
+# searches all of /data, so leftovers from a previous run make "no
+# certificates" false — which is the correct behaviour, just not what this
+# step is measuring.
+docker exec "$LAB_CONTAINER" sh -c 'rm -rf /data/certificates/* /data/caddy/certificates/*' 2>/dev/null || true
+
 CERT_BEFORE_STATE="$(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER")"
 CERT_BEFORE_SNIPPET="$(md5sum "$SNIPPET" | cut -d' ' -f1)"
 
@@ -409,11 +423,11 @@ LAB_CERT_PEM="$LAB_BASE/certcheck.pem"
 if openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
         -subj "/CN=$LAB_CERT_DIR" -keyout /dev/null -out "$LAB_CERT_PEM" 2>/dev/null \
    && docker exec -i "$LAB_CONTAINER" sh -c \
-        "mkdir -p /data/caddy/certificates/$LAB_CERT_DIR && cat > /data/caddy/certificates/$LAB_CERT_DIR/$LAB_CERT_DIR.crt" \
+        "mkdir -p /data/certificates/$LAB_CERT_DIR && cat > /data/certificates/$LAB_CERT_DIR/$LAB_CERT_DIR.crt" \
         < "$LAB_CERT_PEM" 2>/dev/null \
    && [ -s "$LAB_CERT_PEM" ] \
    && docker exec "$LAB_CONTAINER" sh -c \
-        "test -s /data/caddy/certificates/$LAB_CERT_DIR/$LAB_CERT_DIR.crt"; then
+        "test -s /data/certificates/$LAB_CERT_DIR/$LAB_CERT_DIR.crt"; then
     info "planted a certificate expiring in 1 day"
 else
     fail "could not plant a non-empty test certificate inside the container"
@@ -441,14 +455,19 @@ else
     fail "a 0-day window wrongly rejected a valid certificate"
 fi
 
+# /data/certificates, not /data/caddy/certificates: Caddy puts them under the
+# storage root from the Caddyfile, which is /data.
 docker exec "$LAB_CONTAINER" sh -c \
-    "rm -rf /data/caddy/certificates/$LAB_CERT_DIR" >/dev/null 2>&1 || true
+    "rm -rf /data/certificates/$LAB_CERT_DIR" >/dev/null 2>&1 || true
 
-if play "$REPO_ROOT/playbooks/cert-check.yml" "${LAB_VARS[@]}" >/dev/null 2>&1; then
+CERT_OUT="$(mktemp)"
+if play "$REPO_ROOT/playbooks/cert-check.yml" "${LAB_VARS[@]}" >"$CERT_OUT" 2>&1; then
     pass "removing the test certificate restores a passing run"
 else
     fail "cert-check still fails after the test certificate was removed"
+    sed 's/^/    /' "$CERT_OUT" | tail -20
 fi
+rm -f "$CERT_OUT"
 
 # ==============================================================================
 step "no leftover directories from the bash pipeline"

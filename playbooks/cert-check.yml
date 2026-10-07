@@ -41,6 +41,15 @@
   become: "{{ ansible_become | default(false) }}"
   gather_facts: false
 
+  # Loads the same defaults the role uses, so `caddy_container` and friends
+  # resolve without including the role — which this playbook deliberately does
+  # not do, since every task in the role is a change and this one must change
+  # nothing. Without this, running it with no -e failed on
+  # 'caddy_container' is undefined; the lab suite never hit that because it
+  # always passes caddy_container explicitly.
+  vars_files:
+    - ../roles/caddy/defaults/main.yml
+
   vars:
     # A Let's Encrypt certificate lives 90 days and Caddy renews roughly 30 days
     # before expiry. Warn at 21: by then a renewal that has been failing for a
@@ -52,8 +61,17 @@
     # container — but it is still created 0700 and deleted afterwards.
     cert_scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/caddy-cert-check"
 
+
   tasks:
     - name: List the certificate files Caddy has issued
+      # Searched under /data rather than a fixed path, because where these land
+      # depends on the Caddyfile:
+      #   storage file_system { root /data }   -> /data/certificates/...
+      #   no storage block (Caddy default)      -> /data/caddy/certificates/...
+      # Hardcoding either one made this report "0 certificates" on a proxy that
+      # was serving valid certificates — a monitoring check that cannot fail is
+      # worse than none. Verified against a live proxy: with `root /data` the
+      # certificates are in /data/certificates, NOT /data/caddy/certificates.
       ansible.builtin.command:
         argv:
           - docker
@@ -61,7 +79,7 @@
           - "{{ caddy_container }}"
           - sh
           - -c
-          - "find /data/caddy/certificates -type f -name '*.crt' 2>/dev/null || true"
+          - "find /data -type f -name '*.crt' -path '*certificates*' 2>/dev/null || true"
       register: cert_files
       changed_when: false
       failed_when: false
@@ -92,7 +110,7 @@
     # failure to read the store is an error — see the task above.
     - name: Note that no certificate has been issued yet
       ansible.builtin.debug:
-        msg: "{{ ['No certificates have been issued yet under /data/caddy/certificates.',
+        msg: "{{ ['No certificates have been issued yet under /data.',
                     'Nothing to check — the proxy has not issued a certificate for any domain.'] | join(' ') }}"
       when: cert_files.stdout_lines | default([]) | length == 0
 
@@ -141,7 +159,17 @@
       # Anything unreadable prints -1, which trips the check instead.
       ansible.builtin.command:
         argv:
-          - "{{ ansible_playbook_python }}"
+          # The TARGET's python, not ansible_playbook_python. That variable is
+          # a path on the control node — running it on the managed host fails
+          # with "No such file or directory" the moment the two are different
+          # machines, which is every real deployment. The lab never caught it
+          # because ansible_connection: local makes both sides the same host.
+          #
+          # ansible_python_interpreter is what Ansible discovered for this host
+          # (auto_silent in ansible.cfg); falling back to python3 covers a
+          # control node that has not set it. Only the standard library is
+          # used, so any Python 3.6+ on the target will do.
+          - "{{ ansible_python_interpreter | default('python3', true) }}"
           - "-c"
           - |
             import ssl, sys, calendar, time
@@ -204,8 +232,7 @@
 
     - name: Show every certificate and how long it has left
       ansible.builtin.debug:
-        msg: "{{ (cert.name | regex_replace('^.*/certificates/', '')
-                   | regex_replace('/[^/]+$', ''))
+        msg: "{{ (cert.name.split('/')[-2] if cert.name.split('/') | length > 1 else cert.name)
                 ~ ' → ' ~ (cert.days_left | string) ~ ' days left' }}"
       loop: "{{ cert_records | default([]) }}"
       loop_control:

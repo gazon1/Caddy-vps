@@ -79,7 +79,7 @@
           - exec
           - "{{ caddy_container }}"
           - find
-          - /data/caddy/certificates
+          - /data
           - -name
           - "*.crt"
       register: caddy_status_cert_files
@@ -121,7 +121,8 @@
         msg: >-
           No certificate expiry could be read. Either no certificate has been
           issued yet, or the image has no openssl. Certificates normally live
-          under /data/caddy/certificates.
+          under the storage root (usually /data, or /data/caddy when no
+          storage block is set).
       when:
         - (caddy_status_cert_expiry.results | default([]) | length) == 0
 
