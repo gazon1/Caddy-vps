@@ -26,7 +26,7 @@ jobs:
         run: ansible-galaxy collection install -r requirements.yml
 
       - name: Syntax check
-        run: ansible-playbook --syntax-check site.yml playbooks/status.yml
+        run: ansible-playbook --syntax-check site.yml playbooks/status.yml playbooks/cert-check.yml
 
       - name: yamllint
         run: yamllint .

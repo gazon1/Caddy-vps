@@ -1,0 +1,240 @@
+---
+# Certificate expiry check. Read-only: it reads the PEM files Caddy already
+# stored and fails when one is close to expiring. Nothing is written on the
+# managed host, nothing is templated, reloaded, pruned or reissued.
+#
+#   just cert-check
+#   just cert-check -- -e cert_expiry_warning_days=30
+#
+# WHY THIS EXISTS
+#
+# Caddy renews certificates on its own — that is not optional and must never be
+# forced from outside. Reissuing a certificate Caddy is already about to renew
+# burns the Let's Encrypt rate limit, which is how every certificate for a
+# domain gets taken down at once.
+#
+# The real failure mode is a SILENT renewal failure: no route to the ACME
+# endpoint, port 80 blocked, DNS no longer pointing here, or the host was down
+# during the attempt. Caddy then keeps serving the old certificate and nothing
+# complains until a browser refuses the connection. This turns that into a
+# failed run.
+#
+# WHY IT DOES NOT USE openssl INSIDE THE CONTAINER
+#
+# caddy:2.8-alpine ships without openssl — verified with
+# `docker run --rm caddy:2.8-alpine sh -c 'command -v openssl'` (rc=127). A
+# shell pipeline inside the container would therefore produce nothing and this
+# playbook would report "all fine" forever: the exact failure it is meant to
+# catch. So the PEMs are copied out with `cat` and parsed here, with the Python
+# that Ansible already requires. (`playbooks/status.yml` has the same latent
+# problem — its openssl task reports "expiry unreadable" and moves on.)
+#
+# NOTE ON status.yml
+#
+# This deliberately does not reuse playbooks/status.yml. That playbook pulls in
+# the whole caddy role without --tags, so it re-renders Caddyfile and the
+# compose manifest (backup: true) and rotates snippet backups. Fine to run by
+# hand; not something to schedule unattended.
+
+- name: Check certificate expiry on the Caddy proxy
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: false
+
+  vars:
+    # A Let's Encrypt certificate lives 90 days and Caddy renews roughly 30 days
+    # before expiry. Warn at 21: by then a renewal that has been failing for a
+    # week will not fix itself, and there is still enough runway to fix DNS or
+    # an open port without a user-visible outage.
+    cert_expiry_warning_days: 21
+    # Scratch space on the CONTROL node (this one, not the managed host). It
+    # holds copies of public certificates — no private key ever leaves the
+    # container — but it is still created 0700 and deleted afterwards.
+    cert_scratch: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/caddy-cert-check"
+
+  tasks:
+    - name: List the certificate files Caddy has issued
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - sh
+          - -c
+          - "find /data/caddy/certificates -type f -name '*.crt' 2>/dev/null || true"
+      register: cert_files
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the proxy container itself is not usable
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - sh
+          - -c
+          - "test -d /data/caddy"
+      register: cert_storage
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when the certificate store cannot be read at all
+      ansible.builtin.fail:
+        msg: "{{ ['Cannot reach the certificate store inside the proxy container (exit ' ~ (cert_storage.rc | default('?')) ~ ').',
+                    'Either the proxy is not running, or it is running without its storage mounted.',
+                    'Check: docker exec ' ~ caddy_container ~ ' ls -la /data/caddy'] | join(' ') }}"
+      when: cert_storage.rc != 0
+
+    # An empty result is NOT an error: it is a proxy that has never issued a
+    # certificate, which is normal before the first domain is routed. Only a
+    # failure to read the store is an error — see the task above.
+    - name: Note that no certificate has been issued yet
+      ansible.builtin.debug:
+        msg: "{{ ['No certificates have been issued yet under /data/caddy/certificates.',
+                    'Nothing to check — the proxy has not issued a certificate for any domain.'] | join(' ') }}"
+      when: cert_files.stdout_lines | default([]) | length == 0
+
+    - name: Read the stored certificates
+      # `cat` rather than openssl: the image has no openssl, and a PEM is plain
+      # text, so it copies out cleanly.
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - cat
+          - "{{ item }}"
+      loop: "{{ cert_files.stdout_lines | default([]) }}"
+      register: cert_contents
+      changed_when: false
+      failed_when: false
+
+    - name: Create the scratch directory on the control node
+      ansible.builtin.file:
+        path: "{{ cert_scratch }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy each certificate out to the control node
+      ansible.builtin.copy:
+        dest: "{{ cert_scratch }}/{{ item.item | basename }}.pem"
+        content: "{{ item.stdout }}"
+        mode: "0600"
+      loop: "{{ cert_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') | basename }}"
+      when:
+        - item.rc == 0
+        - item.stdout is defined
+        - item.stdout | length > 0
+
+    - name: Work out how many days each certificate has left
+      # ssl._ssl._test_decode_cert is the only expiry reader in the Python
+      # standard library — no cryptography package, no openssl binary. It takes
+      # a path, hence the copy above.
+      #
+      # Prints DAYS LEFT, not a date. Comparing dates in Jinja would depend on
+      # the locale of whoever runs the check, and an unparseable date would
+      # silently become "expires far in the future" — the dangerous direction.
+      # Anything unreadable prints -1, which trips the check instead.
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "-c"
+          - |
+            import ssl, sys, calendar, time
+            try:
+                info = ssl._ssl._test_decode_cert(sys.argv[1])
+                end = calendar.timegm(time.strptime(info['notAfter'], '%b %d %H:%M:%S %Y %Z'))
+                print(max(0, (end - time.time()) // 86400))
+            except Exception as exc:
+                print('unreadable: %s' % exc, file=sys.stderr)
+                print(-1)
+          - "{{ cert_scratch }}/{{ item.item | basename }}.pem"
+      loop: "{{ cert_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') | basename }}"
+      register: cert_expiry
+      changed_when: false
+      failed_when: false
+      when: item.rc == 0
+
+    - name: Remove the scratch copies
+      ansible.builtin.file:
+        path: "{{ cert_scratch }}"
+        state: absent
+
+    # Plain Jinja only: community.docker is the single declared dependency, so
+    # a filter from community.general would break on any machine that satisfies
+    # requirements.yml. Each record is appended in its own loop iteration, which
+    # also avoids pairing two filtered lists with zip — where a mismatch would
+    # silently attach a date to the wrong certificate.
+    #
+    # The record is assembled inline rather than through a `vars:` block on
+    # purpose: an indirection there is templated lazily, and `item.item` came
+    # back as the whole registered result instead of the certificate path.
+    - name: Build one record per certificate
+      ansible.builtin.set_fact:
+        cert_records: >-
+          {{ (cert_records | default([]))
+             + [{'name': item.item.item, 'days_left': item.stdout | trim | int}] }}
+      loop: "{{ cert_expiry.results | default([]) }}"
+      when:
+        - item.item is defined
+        - item.item.item is defined
+        - item.item.item | length > 0
+        - item.stdout is defined
+        - item.stdout | trim | length > 0
+
+    - name: Report how many certificates could not be read
+      ansible.builtin.fail:
+        msg: "{{ ['Could not read the expiry of ' ~ (cert_unreadable | length) ~ ' certificate(s).',
+                    'A certificate that cannot be parsed must not count as healthy, because an unreadable',
+                    'expiry is exactly what a silently failed renewal looks like. Check by hand:',
+                    'docker exec ' ~ caddy_container ~ ' cat <path-to-crt> | openssl x509 -enddate -noout'] | join(' ') }}"
+      vars:
+        cert_unreadable: >-
+          {{ cert_expiry.results | default([])
+             | selectattr('stdout', 'defined')
+             | selectattr('stdout', 'eq', '-1') | list }}
+      when: cert_unreadable | length > 0
+
+    - name: Show every certificate and how long it has left
+      ansible.builtin.debug:
+        msg: "{{ (cert.name | regex_replace('^.*/certificates/', '')
+                   | regex_replace('/[^/]+$', ''))
+                ~ ' → ' ~ (cert.days_left | string) ~ ' days left' }}"
+      loop: "{{ cert_records | default([]) }}"
+      loop_control:
+        loop_var: cert
+
+    - name: Collect the certificates that need attention
+      ansible.builtin.set_fact:
+        cert_expiring: >-
+          {{ cert_records | default([])
+             | selectattr('days_left', 'defined')
+             | selectattr('days_left', 'lt', cert_expiry_warning_days | int)
+             | list }}
+
+    - name: Fail when a certificate is inside the warning window
+      # Assembled as a list and joined: a folded YAML scalar keeps its line
+      # break, and a multi-line ::error:: annotation is a wall of text in the
+      # Actions log.
+      ansible.builtin.fail:
+        msg: "{{ ['Certificates expiring within ' ~ cert_expiry_warning_days ~ ' days:',
+                    cert_expiring | map(attribute='name')
+                                 | map('regex_replace', '^.*/certificates/', '')
+                                 | map('regex_replace', '/[^/]+$', '') | list | join(', '),
+                    'Caddy normally renews about 30 days ahead, so a certificate this close means renewal',
+                    'is failing. Check that the proxy can reach the ACME endpoint, that port 80 is open for',
+                    'HTTP-01, and that DNS for the domain points at this host. Do NOT force a reissue from',
+                    'outside — that burns the Lets Encrypt rate limit for every name on the domain.'
+                   ] | join(' ') }}"
+      when: cert_expiring | default([]) | length > 0
+
+    - name: Report a healthy certificate store
+      ansible.builtin.debug:
+        msg: "{{ ['All ' ~ (cert_records | default([]) | length) ~ ' certificate(s) are outside the '
+                    ~ cert_expiry_warning_days ~ '-day warning window.'] | join(' ') }}"
+      when: cert_expiring | default([]) | length == 0

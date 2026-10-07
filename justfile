@@ -9,6 +9,7 @@
 #   just bootstrap    — install / repair the proxy on the target host
 #   just route N F    — apply one route snippet (with backup + rollback)
 #   just status       — read-only inspection
+#   just cert-check   — read-only: fail if a certificate is close to expiry
 #   just lab-test     — prove the above locally, without touching the VPS
 #
 # Anything the wrappers do not cover is passed straight through to
@@ -23,6 +24,7 @@ REPO := justfile_directory()
 INVENTORY := REPO / "inventory" / "hosts.yml"
 SITE := REPO / "site.yml"
 STATUS := REPO / "playbooks" / "status.yml"
+CERT_CHECK := REPO / "playbooks" / "cert-check.yml"
 LAB := REPO / "tests" / "lab.sh"
 
 export PATH := home_directory() / ".local" / "bin" + ":" + env("PATH")
@@ -59,6 +61,16 @@ route name file *args:
 status *args:
     #!/usr/bin/env bash
     ansible-playbook "{{ STATUS }}" {{ args }}
+
+# ---- CERTIFICATES ----
+# Monitoring only. Caddy renews certificates on its own and this deliberately
+# does not force a reissue — repeating an already-scheduled issuance burns the
+# Let's Encrypt rate limit. What it catches is a renewal that has silently
+# stopped working, which is otherwise invisible until browsers reject the site.
+[doc("Fail if a certificate is within 21 days of expiry (read-only)")]
+cert-check *args:
+    #!/usr/bin/env bash
+    ansible-playbook "{{ CERT_CHECK }}" {{ args }}
 
 # ---- LOCAL VERIFICATION ----
 [doc("Run the local lab suite against Docker (does not touch the VPS)")]

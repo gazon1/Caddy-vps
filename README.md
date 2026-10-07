@@ -145,6 +145,29 @@ Certificates live in `/opt/caddy/data`. **That directory must never be
 deleted or pruned.** Losing it forces every certificate to be reissued and
 burns through the Let's Encrypt rate limit.
 
+Caddy automatically renews them, and you should never force a reissue from
+outside: repeating an issuance Caddy is already about to make burns the
+Let's Encrypt rate limit, which is how every certificate for a domain gets
+taken down at once.
+
+What deserves monitoring is a renewal that has **silently stopped working** —
+no route to the ACME endpoint, port 80 blocked, DNS no longer pointing here, or
+the host down during the attempt. Caddy then keeps serving the old certificate
+until a browser refuses the connection.
+
+```bash
+just cert-check          # fails when a certificate is within 21 days of expiry
+just cert-check -- -e cert_expiry_warning_days=30
+```
+
+Read-only: it reads the PEMs Caddy stored and writes nothing on the server.
+It deliberately does not use `status.yml`, which pulls in the whole role and
+re-renders the base configuration.
+
+Note that the caddy image ships without `openssl`, so the expiry is parsed with
+the Python that Ansible already requires. `status.yml` still reports
+"expiry unreadable" for the same reason — prefer `cert-check` for this.
+
 ## Testing changes without the VPS
 
 ```bash
@@ -160,7 +183,8 @@ the previous route throughout. ACME is never contacted.
 
 ```
 site.yml                 the one entry point
-playbooks/status.yml     read-only inspection
+playbooks/status.yml     read-only inspection (see the caveat in Certificates)
+playbooks/cert-check.yml read-only: certificate expiry, safe to schedule
 roles/caddy/             the role: tasks, templates, handlers
 inventory/               where the servers are, and their defaults
 tests/lab.sh             local verification suite

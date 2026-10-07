@@ -325,6 +325,89 @@ AFTER_SNIPPET="$(md5sum "$SNIPPET" | cut -d' ' -f1)"
     || fail "status.yml modified the route snippet"
 
 # ==============================================================================
+step "playbooks/cert-check.yml is read-only and passes with no certificates"
+# The lab proxy never talks to ACME, so its certificate store is empty. That is
+# itself worth asserting: a monitoring job that runs nightly must not fail, and
+# must not touch anything, before any certificate exists.
+CERT_BEFORE_STATE="$(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER")"
+CERT_BEFORE_SNIPPET="$(md5sum "$SNIPPET" | cut -d' ' -f1)"
+
+if cert_out="$(play "$REPO_ROOT/playbooks/cert-check.yml" "${LAB_VARS[@]}" 2>&1)"; then
+    pass "cert-check succeeds with an empty certificate store"
+else
+    fail "cert-check failed with an empty certificate store: ${cert_out}"
+fi
+
+CERT_AFTER_STATE="$(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER")"
+CERT_AFTER_SNIPPET="$(md5sum "$SNIPPET" | cut -d' ' -f1)"
+
+[[ "$CERT_BEFORE_STATE" == "$CERT_AFTER_STATE" ]] && pass "cert-check left the container state alone" \
+    || fail "cert-check changed the container state"
+[[ "$CERT_BEFORE_SNIPPET" == "$CERT_AFTER_SNIPPET" ]] && pass "cert-check left the route snippet alone" \
+    || fail "cert-check modified the route snippet"
+
+# ==============================================================================
+step "cert-check fails when a certificate is about to expire"
+# Plants a certificate that expires tomorrow, then removes it again.
+# This is the whole point of the check: a renewal that stopped working has to
+# turn into a failed run, not a silent expiry.
+#
+# Generated on the HOST and piped into the container, because caddy:2.8-alpine
+# has no openssl (verified: `command -v openssl` → rc=127) and /data is a bind
+# mount owned by root that the unprivileged lab user cannot write to. The
+# pipeline keeps the check itself honest — it only ever reads what a real Caddy
+# would have written there.
+LAB_CERT_DIR="lab.example.invalid"
+LAB_CERT_PEM="$LAB_BASE/certcheck.pem"
+
+# `-i` is required: without it docker exec does not attach stdin, `cat` reads
+# EOF immediately and writes a zero-byte file — which would make this test pass
+# for the wrong reason (an unreadable certificate rather than an expiring one).
+if openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -subj "/CN=$LAB_CERT_DIR" -keyout /dev/null -out "$LAB_CERT_PEM" 2>/dev/null \
+   && docker exec -i "$LAB_CONTAINER" sh -c \
+        "mkdir -p /data/caddy/certificates/$LAB_CERT_DIR && cat > /data/caddy/certificates/$LAB_CERT_DIR/$LAB_CERT_DIR.crt" \
+        < "$LAB_CERT_PEM" 2>/dev/null \
+   && [ -s "$LAB_CERT_PEM" ] \
+   && docker exec "$LAB_CONTAINER" sh -c \
+        "test -s /data/caddy/certificates/$LAB_CERT_DIR/$LAB_CERT_DIR.crt"; then
+    info "planted a certificate expiring in 1 day"
+else
+    fail "could not plant a non-empty test certificate inside the container"
+fi
+
+if warn_out="$(play "$REPO_ROOT/playbooks/cert-check.yml" \
+        "${LAB_VARS[@]}" -e cert_expiry_warning_days=21 2>&1)"; then
+    fail "cert-check passed despite a certificate expiring in 1 day"
+else
+    if grep -q "$LAB_CERT_DIR" <<<"$warn_out"; then
+        pass "cert-check failed and named the expiring certificate"
+    else
+        fail "cert-check failed but did not name $LAB_CERT_DIR: ${warn_out}"
+    fi
+fi
+
+# ==============================================================================
+step "the warning threshold is actually compared"
+# Same certificate, but the window is set below its remaining lifetime: proves
+# the threshold is evaluated rather than hardcoded to "any certificate fails".
+if play "$REPO_ROOT/playbooks/cert-check.yml" "${LAB_VARS[@]}" \
+        -e cert_expiry_warning_days=0 >/dev/null 2>&1; then
+    pass "a 0-day window accepts a certificate that has not expired yet"
+else
+    fail "a 0-day window wrongly rejected a valid certificate"
+fi
+
+docker exec "$LAB_CONTAINER" sh -c \
+    "rm -rf /data/caddy/certificates/$LAB_CERT_DIR" >/dev/null 2>&1 || true
+
+if play "$REPO_ROOT/playbooks/cert-check.yml" "${LAB_VARS[@]}" >/dev/null 2>&1; then
+    pass "removing the test certificate restores a passing run"
+else
+    fail "cert-check still fails after the test certificate was removed"
+fi
+
+# ==============================================================================
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     printf '\033[0;32m✅ Lab suite passed\033[0m\n'
