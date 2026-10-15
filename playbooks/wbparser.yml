@@ -8,32 +8,53 @@
 #
 # Role order and rationale:
 #
-#   1. adsbrowser  installs Xvfb, the adspower-browser CLI, starts the virtual
-#                display, and verifies a headless browser launch. Must run before
-#                the crawler if the crawler uses AdsPower for browser automation.
-#   2. wbparser   pulls the image, runs the container, health-gates it, and rolls
+#   1. adsbrowser_api  starts the AdsPower Local API server (native systemd).
+#                This must be running BEFORE adsbrowser verifies headless launch.
+#                The API key is resolved from WBPARSER_ADMIN_API_KEY if not
+#                passed explicitly with -e adsbrowser_api_key=...
+#   2. adsbrowser  installs Xvfb, the adspower-browser CLI, starts the virtual
+#                display, and verifies a headless browser launch.
+#   3. wbparser   pulls the image, runs the container, health-gates it, and rolls
 #                back on failure.
-#   3. caddy routes.yml  publishes the route. Registering a route to a container
+#   4. caddy routes.yml  publishes the route. Registering a route to a container
 #                that is not yet up would let Caddy forward into the void while
 #                caddy validate passes — which is exactly what this gate prevents.
-#
-# The AdsPower Local API must be running BEFORE adsbrowser tries to verify the
-# headless launch. On the VPS that is satisfied by the kotlin-try adspower
-# container:  cd /opt/kotlin-try && docker compose up -d adspower
 
-- name: Deploy adsbrowser headless browser and wb-parser crawler
+- name: Deploy adsbrowser API, headless browser and wb-parser crawler
   hosts: vps
   become: "{{ ansible_become | default(false) }}"
   gather_facts: true
 
+  # Load encrypted vault if ANSIBLE_VAULT_PASSWORD_FILE is configured.
+  # Runs before roles so vault_adsbrowser_api_key is available in adsbrowser_api vars.
+  pre_tasks:
+    - name: Load vault secrets if configured
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../inventory/group_vars/vps/vault.yml"
+      ignore_errors: true
+      tags: [always]
+
   vars_files:
-    # The caddy role's defaults, loaded without running the role. routes.yml needs
-    # caddy_conf_d, caddy_container, caddy_owner, caddy_group and friends, and
-    # re-declaring them here would be a second copy to keep in step with the role.
+    # Caddy role defaults (needed by routes.yml import, without running the role).
     - "{{ playbook_dir }}/../roles/caddy/defaults/main.yml"
 
   vars:
-    # Resolved at play level: explicit -e adsbrowser_api_key wins, else WBPARSER_ADMIN_API_KEY from env.
+    # Resolved at play level (priority order):
+    #   1. explicit -e adsbrowser_api_key=<key>
+    #   2. WBPARSER_ADMIN_API_KEY from environment
+    #   3. vault_adsbrowser_api_key from inventory/group_vars/vps/vault.yml
+    adsbrowser_api_key: >-
+      {{
+        adsbrowser_api_key | default('') | length > 0 | ternary(
+          adsbrowser_api_key,
+          (
+            lookup('env', 'WBPARSER_ADMIN_API_KEY') | length > 0 | ternary(
+              lookup('env', 'WBPARSER_ADMIN_API_KEY'),
+              vault_adsbrowser_api_key | default('')
+            )
+          )
+        )
+      }}
 
     # Where deploy/docker-compose.vps.yml lives on the control node. `just deploy`
     # passes this explicitly; the environment variable is the fallback for running
@@ -46,6 +67,8 @@
     caddy_route_url: "{{ wbparser_route_url }}"
 
   roles:
+    - role: adsbrowser_api
+      tags: [adsbrowser-api]
     - role: adsbrowser
       tags: [adsbrowser]
     - role: wbparser

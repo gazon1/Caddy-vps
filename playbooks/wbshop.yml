@@ -28,12 +28,9 @@
 # ==============================================================================
 
 - name: Deploy adsbrowser headless browser
-  hosts: vps
+  hosts: "{{ 'vps' if (adspower_enabled | default(true) | bool) else 'none' }}"
   become: "{{ ansible_become | default(false) }}"
   gather_facts: true
-  # Set adspower_enabled=false to skip if the parser does not use AdsPower automation.
-  # Requires adsbrowser_api_key (or WBPARSER_ADMIN_API_KEY) when enabled.
-  when: adspower_enabled | default(true) | bool
 
   vars:
     adsbrowser_api_key: "{{ lookup('env', 'WBPARSER_ADMIN_API_KEY') | default('', true) }}"

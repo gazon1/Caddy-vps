@@ -1,19 +1,59 @@
 ---
-# Remove adsbrowser from the VPS: stop Xvfb, uninstall adspower-browser, purge config.
+# Remove adsbrowser and adsbrowser-api from the VPS.
 #
 #   just adsbrowser-cleanup
 #   just adsbrowser-cleanup --check  # dry-run first
 #
-# This does NOT remove the kotlin-try adspower container — that belongs to
-# kotlin-try, not to adsbrowser. The kotlin-try docker-compose is managed
-# separately.
+# Removes (in order):
+#   1. adsbrowser-api  — stops systemd unit, removes /usr/local/lib/adspower
+#   2. adsbrowser      — stops Xvfb, removes adspower-browser files
+#
+# Does NOT touch:
+#   - kotlin-try containers
+#   - wbparser container
+#   - Caddy proxy
 
-- name: Cleanup adsbrowser from the VPS
+- name: Cleanup adsbrowser and adsbrowser-api from the VPS
   hosts: vps
   become: "{{ ansible_become | default(false) }}"
   gather_facts: true
 
   tasks:
+
+    # ── adsbrowser-api ────────────────────────────────────────────────────────
+
+    - name: Stop and disable adsbrowser-api systemd service
+      ansible.builtin.systemd:
+        name: adsbrowser-api
+        enabled: false
+        state: stopped
+      become: true
+      failed_when: false
+      changed_when: true
+
+    - name: Remove adsbrowser-api systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/adsbrowser-api.service
+        state: absent
+      become: true
+      changed_when: true
+      notify: Reload systemd
+
+    - name: Remove /usr/local/bin/ads symlink
+      ansible.builtin.file:
+        path: /usr/local/bin/ads
+        state: absent
+      become: true
+      changed_when: true
+
+    - name: Remove /usr/local/lib/adspower installation directory
+      ansible.builtin.file:
+        path: /usr/local/lib/adspower
+        state: absent
+      become: true
+      changed_when: true
+
+    # ── adsbrowser ────────────────────────────────────────────────────────────
 
     - name: Stop and disable Xvfb systemd service
       ansible.builtin.systemd:
@@ -39,12 +79,11 @@
       become: true
       changed_when: true
 
-    - name: Uninstall adspower-browser npm package
-      ansible.builtin.command:
-        argv: [npm, uninstall, -g, "adspower-browser@{{ adsbrowser_cli_version | default('2.1.1') }}"]
+    - name: Remove /usr/local/bin/adsbrowser symlink
+      ansible.builtin.file:
+        path: /usr/local/bin/adsbrowser
+        state: absent
       become: true
-      register: _adsbrowser_uninstall
-      failed_when: false
       changed_when: true
 
     - name: Remove adsbrowser config directory
@@ -68,7 +107,7 @@
 
     - name: Report cleanup completed
       ansible.builtin.debug:
-        msg: "Adsbrowser cleanup complete. Xvfb stopped, adspower-browser removed, config purged."
+        msg: "Cleanup complete. adsbrowser-api and adsbrowser removed."
 
   handlers:
     - name: Reload systemd

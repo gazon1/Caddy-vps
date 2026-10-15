@@ -6,7 +6,12 @@
 
 # Secrets. Copy .env.example, fill it in, keep it out of git.
 .env
+# Ansible vault — encrypted secrets (group_vars/*/vault.yml)
+vault.yml
 *.vault
+
+# Local vault password (never commit this)
+.vault_pass
 
 # Editor / OS noise
 *.swp

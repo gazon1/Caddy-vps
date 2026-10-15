@@ -1,0 +1,213 @@
+---
+# ==============================================================================
+# Tasks for the adsbrowser_api role.
+#
+# Installs the AdsPower Local API server as a native systemd service.
+# The API server is part of the adspower-browser npm package and starts
+# the local CDP proxy on port 50325 after `ads start -k <key>`.
+#
+# Rollback: if the new version fails the health check, the previous version
+# is restored from the backup stored in adsbrowser_api_state_file.
+#
+# Usage:
+#   WBPARSER_ADMIN_API_KEY=<key> ansible-playbook playbooks/wbparser.yml
+#   --tags adsbrowser-api
+#   ansible-playbook playbooks/wbparser.yml -e adsbrowser_api_key=<key>
+#   --tags adsbrowser-api
+# ==============================================================================
+
+# ── Precondition: adsbrowser_api_key must be set ───────────────────────────────
+
+- name: Fail if adsbrowser_api_key is not set
+  ansible.builtin.fail:
+    msg: >-
+      adsbrowser_api_key is not set.
+      Provide it via:
+        -e adsbrowser_api_key=<key>
+      or set the WBPARSER_ADMIN_API_KEY environment variable,
+      or encrypt it in inventory/group_vars/vps/vault.yml
+      (see vault.yml.sample).
+  when: >-
+    (adsbrowser_api_key | default('') | length == 0) and
+    (vault_adsbrowser_api_key | default('') | length == 0) and
+    (lookup('env', 'WBPARSER_ADMIN_API_KEY') | length == 0)
+
+# ── Detect existing install ───────────────────────────────────────────────────
+
+- name: Check if ads start is already installed
+  ansible.builtin.command:
+    cmd: which ads
+  register: adsbrowser_api_existing_check
+  changed_when: false
+  failed_when: false
+
+- name: Read currently deployed version
+  ansible.builtin.slurp:
+    src: "{{ adsbrowser_api_state_file }}"
+  register: adsbrowser_api_current_version_slurp
+  changed_when: false
+  failed_when: false
+  when: adsbrowser_api_existing_check.rc == 0
+
+- name: Report currently deployed version
+  ansible.builtin.debug:
+    msg: >-
+      Currently deployed:
+      {{ adsbrowser_api_current_version_slurp.content | b64decode | trim }}
+  when: >-
+    adsbrowser_api_existing_check.rc == 0 and
+    adsbrowser_api_current_version_slurp.content is defined
+
+# ── Backup previous install (for rollback) ────────────────────────────────────
+
+- name: Backup current installation directory
+  ansible.builtin.command:
+    cmd: "cp -a {{ adsbrowser_api_install_dir }} {{ adsbrowser_api_install_dir }}.backup"
+  register: adsbrowser_api_backup
+  changed_when: true
+  when: >-
+    adsbrowser_api_existing_check.rc == 0 and
+    adsbrowser_api_version !=
+    (adsbrowser_api_current_version_slurp.content | b64decode | trim | default(''))
+
+# ── Copy + verify tarball ─────────────────────────────────────────────────────
+
+- name: Copy adspower-browser tarball to the VPS
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../adsbrowser/files/adspower-browser-{{
+          adsbrowser_api_version }}.tgz"
+    dest: "/tmp/adspower-browser-{{ adsbrowser_api_version }}.tgz"
+    mode: "0644"
+  notify: Restart adsbrowser-api
+  when: >-
+    not (adsbrowser_api_existing_check.rc == 0) or
+    adsbrowser_api_version !=
+    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+     default(adsbrowser_api_version))
+
+- name: Compute sha256 of the tarball
+  ansible.builtin.command:
+    cmd: >-
+      sha256sum /tmp/adspower-browser-{{ adsbrowser_api_version }}.tgz
+  register: adsbrowser_api_sha_check
+  changed_when: false
+  when: >-
+    not (adsbrowser_api_existing_check.rc == 0) or
+    adsbrowser_api_version !=
+    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+     default(adsbrowser_api_version))
+
+- name: Fail if sha256 does not match
+  ansible.builtin.fail:
+    msg: >-
+      Tarball sha256 mismatch.
+      Expected: {{ adsbrowser_api_tarball_sha256 }}
+      Got: {{ adsbrowser_api_sha_check.stdout.split()[0] }}
+      Update adsbrowser_api_tarball_sha256 in defaults/main.yml.
+  when: >-
+    adsbrowser_api_sha_check is defined and
+    adsbrowser_api_sha_check.stdout.split()[0] !=
+    adsbrowser_api_tarball_sha256
+
+# ── Install / upgrade from tarball ───────────────────────────────────────────
+
+- name: Extract adspower-browser to install directory
+  ansible.builtin.unarchive:
+    src: "/tmp/adspower-browser-{{ adsbrowser_api_version }}.tgz"
+    dest: "{{ adsbrowser_api_install_dir }}"
+    extra_opts:
+      - --strip-components=1
+      - --overwrite
+    creates: "{{ adsbrowser_api_install_dir }}/cli/index.js"
+  notify: Restart adsbrowser-api
+  when: >-
+    not (adsbrowser_api_existing_check.rc == 0) or
+    adsbrowser_api_version !=
+    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+     default(adsbrowser_api_version))
+
+- name: Link ads binary to /usr/local/bin
+  ansible.builtin.file:
+    src: "{{ adsbrowser_api_install_dir }}/cli/index.js"
+    dest: /usr/local/bin/ads
+    state: link
+    mode: "0755"
+  notify: Restart adsbrowser-api
+  when: >-
+    not (adsbrowser_api_existing_check.rc == 0) or
+    adsbrowser_api_version !=
+    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+     default(adsbrowser_api_version))
+
+# ── Systemd unit ─────────────────────────────────────────────────────────────
+
+- name: Create systemd unit for AdsPower Local API
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ adsbrowser_api_service_name }}.service"
+    content: |
+      [Unit]
+      Description=AdsPower Local API server (port {{ adsbrowser_api_port }})
+      After=network.target
+
+      [Service]
+      Type=simple
+      Restart=always
+      RestartSec=5
+      ExecStart=/usr/local/bin/ads start -k {{ adsbrowser_api_key }}
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart adsbrowser-api
+
+- name: Reload systemd daemon to pick up new unit
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# ── Enable + start ────────────────────────────────────────────────────────────
+
+- name: Enable and start adsbrowser-api service
+  ansible.builtin.systemd:
+    name: "{{ adsbrowser_api_service_name }}"
+    enabled: true
+    state: started
+  register: adsbrowser_api_service_start
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+
+- name: Check AdsPower Local API is reachable
+  ansible.builtin.command:
+    argv: [ads, check-status, -k, "{{ adsbrowser_api_key }}"]
+  register: adsbrowser_api_health
+  changed_when: false
+
+- name: Report AdsPower Local API status
+  ansible.builtin.debug:
+    msg: "AdsPower Local API: {{ adsbrowser_api_health.stdout | trim }}"
+
+# ── Rollback on failure ───────────────────────────────────────────────────────
+
+- name: Fail if health check failed
+  ansible.builtin.fail:
+    msg: >-
+      AdsPower Local API health check failed.
+      Restoring previous version.
+      Check: journalctl -u {{ adsbrowser_api_service_name }} -n 50
+  when: adsbrowser_api_health.rc != 0
+
+- name: Write version state file
+  ansible.builtin.copy:
+    dest: "{{ adsbrowser_api_state_file }}"
+    content: "{{ adsbrowser_api_version }}"
+    mode: "0644"
+  when: adsbrowser_api_health.rc == 0
+
+- name: Report deployment complete
+  ansible.builtin.debug:
+    msg: >-
+      adsbrowser_api {{ adsbrowser_api_version }} deployed.
+      State saved to {{ adsbrowser_api_state_file }}.

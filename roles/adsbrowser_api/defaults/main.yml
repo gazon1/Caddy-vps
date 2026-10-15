@@ -1,0 +1,40 @@
+# ==============================================================================
+---
+# Defaults for the adsbrowser_api role.
+# Installs the AdsPower Local API server as a native systemd service.
+# The API server is part of the adspower-browser npm package.
+# ==============================================================================
+
+# --- CLI version + integrity -------------------------------------------------
+adsbrowser_api_version: "2.1.1"
+
+# sha256 of the tarball in files/. Updated automatically when the tarball changes:
+#   just adsbrowser-update [version]
+# Or manually:
+#   sha256sum ../adsbrowser/files/adspower-browser-{{ adsbrowser_api_version }}.tgz
+adsbrowser_api_tarball_sha256: "f19a451fa5bea9f8a2f4f3e2c60d42978db54cde9ba602f7ce6c7dcb6fe833e9"
+
+# --- AdsPower Local API -------------------------------------------------------
+# REQUIRED. The API key for the AdsPower account.
+# Provide via -e adsbrowser_api_key=<key>, or set WBPARSER_ADMIN_API_KEY.
+# If neither is set, the role fails with a clear error.
+adsbrowser_api_key: ""
+
+# Where the CLI is installed.
+adsbrowser_api_install_dir: "/usr/local/lib/adspower"
+
+# The systemd unit name.
+adsbrowser_api_service_name: "adsbrowser-api"
+
+# The endpoint where the AdsPower Local API is reachable after startup.
+adsbrowser_api_endpoint: "http://localhost:50325"
+adsbrowser_api_port: "50325"
+
+# --- Startup timeout ---------------------------------------------------------
+# How long to wait for the API server to open port 50325 after starting.
+adsbrowser_api_startup_timeout: 30
+
+# --- State file (rollback) --------------------------------------------------
+# Written on successful install. Used for rollback if a new version fails to start.
+# Format: <version>|<timestamp>
+adsbrowser_api_state_file: "{{ adsbrowser_api_install_dir }}/.deployed-version"

@@ -1,0 +1,19 @@
+---
+# ==============================================================================
+# Handlers for the adsbrowser_api role.
+# ==============================================================================
+
+- name: Restart adsbrowser-api
+  ansible.builtin.systemd:
+    name: "{{ adsbrowser_api_service_name }}"
+    state: restarted
+    daemon_reload: true
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Reload adsbrowser-api
+  ansible.builtin.systemd:
+    name: "{{ adsbrowser_api_service_name }}"
+    state: reloaded

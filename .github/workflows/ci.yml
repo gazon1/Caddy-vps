@@ -34,7 +34,14 @@ jobs:
         run: ansible-galaxy collection install -r requirements.yml
 
       - name: Syntax check
-        run: ansible-playbook --syntax-check site.yml playbooks/status.yml playbooks/cert-check.yml playbooks/wbshop.yml playbooks/wbparser.yml
+        run: >-
+          ansible-playbook --syntax-check
+          site.yml
+          playbooks/status.yml
+          playbooks/cert-check.yml
+          playbooks/wbshop.yml
+          playbooks/wbparser.yml
+          playbooks/adsbrowser-cleanup.yml
 
       - name: yamllint
         run: yamllint .

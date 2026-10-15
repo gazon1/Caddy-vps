@@ -2,7 +2,7 @@
 # Per-group defaults for the production VPS. Anything here can be overridden
 # with -e on the command line. See roles/caddy/defaults/main.yml for the full
 # list of knobs and their meaning.
-#
+
 caddy_acme_email: drobin.me@yandex.ru
 
 # Pinned, not the floating `caddy:2-alpine` this host was originally created

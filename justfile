@@ -98,13 +98,9 @@ wbparser-deploy *args:
     ansible-playbook "{{ REPO }}/playbooks/wbparser.yml" {{ args }}
 
 # ---- ADSBROWSER DEPLOY ----
-# Install Xvfb, adspower-browser CLI, start the virtual display, and verify
-# that AdsPower launches a browser in headless mode.
-#
-# Prerequisites:
-#   The AdsPower Local API must already be running at localhost:50325.
-#   On the VPS that means the kotlin-try adspower container is up:
-#     cd /opt/kotlin-try && docker compose -f docker-compose.prod.yml up -d adspower
+# Deploys the full adsbrowser stack onto the VPS:
+#   1. adsbrowser_api  — AdsPower Local API as native systemd (port 50325)
+#   2. adsbrowser     — Xvfb + headless browser verification
 #
 # Required:
 #   adsbrowser_api_key   AdsPower Local API key (same as WBPARSER_ADMIN_API_KEY)
@@ -115,21 +111,68 @@ wbparser-deploy *args:
 #
 #   just adsbrowser-deploy -e adsbrowser_api_key=<key>
 #   just adsbrowser-deploy -e adsbrowser_api_key=<key> -e adsbrowser_test_profile_id=kxpu63n
-[doc("Install adsbrowser CLI, start Xvfb, verify headless browser launch")]
+[doc("Deploy adsbrowser-api (systemd) and adsbrowser (Xvfb) to the VPS")]
 adsbrowser-deploy *args:
     #!/usr/bin/env bash
-    ansible-playbook "{{ REPO }}/playbooks/wbparser.yml" --tags adsbrowser {{ args }}
+    ansible-playbook "{{ REPO }}/playbooks/wbparser.yml" --tags adsbrowser-api,adsbrowser {{ args }}
 
 # ---- ADSBROWSER CLEANUP ----
-# Remove adsbrowser from the VPS: stop Xvfb, disable service, uninstall CLI, purge config.
-# Does NOT remove the kotlin-try adspower container.
+# Remove adsbrowser-api and adsbrowser from the VPS.
+# Does NOT touch the wbparser container or Caddy.
 #
 #   just adsbrowser-cleanup
 #   just adsbrowser-cleanup --check  # dry-run first
-[doc("Stop Xvfb, uninstall adspower-browser, purge adsbrowser config")]
+[doc("Stop and remove adsbrowser-api and adsbrowser from the VPS")]
 adsbrowser-cleanup *args:
     #!/usr/bin/env bash
     ansible-playbook "{{ REPO }}/playbooks/adsbrowser-cleanup.yml" {{ args }}
+
+# ---- ADSBROWSER UPDATE ----
+# Update the adspower-browser CLI version.
+# Steps:
+#   1. Download the new version from npm
+#   2. Compute sha256
+#   3. Open roles/adsbrowser_api/defaults/main.yml for editing
+#
+# Usage:
+#   just adsbrowser-update [version]   # default: latest
+#   just adsbrowser-update 2.2.0
+[doc("Update adspower-browser version: download, sha256, open defaults")]
+adsbrowser-update version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    V="{{ version }}"
+    if [ -z "$V" ]; then
+        V=$(npm show adspower-browser version)
+        echo "[adsbrowser-update] Latest version: $V"
+    fi
+
+    echo "[adsbrowser-update] Downloading adspower-browser@$V ..."
+    TMP=$(mktemp -d)
+    npm pack "adspower-browser@$V" --pack-destination "$TMP" > /dev/null
+
+    PKG=$(ls "$TMP"/adspower-browser-*.tgz)
+    SHA=$(sha256sum "$PKG" | awk '{print $1}')
+    echo "[adsbrowser-update] sha256: $SHA"
+
+    cp "$PKG" "{{ REPO }}/roles/adsbrowser/files/adspower-browser-${V}.tgz"
+    echo "[adsbrowser-update] Copied to roles/adsbrowser/files/"
+
+    rm -rf "$TMP"
+
+    echo ""
+    echo "[adsbrowser-update] Update these values in:"
+    echo "  roles/adsbrowser/defaults/main.yml"
+    echo "    adsbrowser_cli_version: \"$V\""
+    echo "    adsbrowser_tarball_sha256: \"$SHA\""
+    echo ""
+    echo "  roles/adsbrowser-api/defaults/main.yml"
+    echo "    adsbrowser_api_version: \"$V\""
+    echo "    adsbrowser_api_tarball_sha256: \"$SHA\""
+    echo ""
+    echo "[adsbrowser-update] Old files can be removed; Ansible uses the version from defaults."
+    $EDITOR "{{ REPO }}/roles/adsbrowser/defaults/main.yml"
 
 # ---- LOCAL VERIFICATION ----
 [doc("Run the local lab suite against Docker (does not touch the VPS)")]
