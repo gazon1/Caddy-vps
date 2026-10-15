@@ -19,7 +19,10 @@
 #   WBSHOP_COMPOSE_SRC      — path to wbshop's docker-compose.yml (optional, uses app.env)
 #   WBPARSER_DB_PASSWORD    — database password
 #   WBPARSER_ADMIN_PASSWORD — admin password
-#   WBPARSER_ADMIN_API_KEY  — admin API key
+#   WBPARSER_ADMIN_API_KEY  — admin API key (used for adsbrowser when adspower_enabled=true)
+#
+# Optional variables:
+#   adspower_enabled         — set false to skip adsbrowser (default: true)
 #
 # The Caddy-vps directory convention: roles own the logic, playbooks wire them.
 # ==============================================================================
@@ -28,6 +31,12 @@
   hosts: vps
   become: "{{ ansible_become | default(false) }}"
   gather_facts: true
+  # Set adspower_enabled=false to skip if the parser does not use AdsPower automation.
+  # Requires adsbrowser_api_key (or WBPARSER_ADMIN_API_KEY) when enabled.
+  when: adspower_enabled | default(true) | bool
+
+  vars:
+    adsbrowser_api_key: "{{ lookup('env', 'WBPARSER_ADMIN_API_KEY') | default('', true) }}"
 
   roles:
     - role: adsbrowser
