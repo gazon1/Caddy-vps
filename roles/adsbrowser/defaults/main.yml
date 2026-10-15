@@ -1,0 +1,34 @@
+# ==============================================================================
+# Defaults for the adsbrowser role.
+# Every value can be overridden with -e on the command line.
+# ==============================================================================
+
+# --- CLI version --------------------------------------------------------------
+adsbrowser_cli_version: "2.1.1"
+
+# --- AdsPower Local API -------------------------------------------------------
+# The endpoint where the AdsPower Local API is reachable.
+# On the VPS this is typically the kotlin-try adspower container:
+#   http://host.docker.internal:50325  (if running in docker on the VPS)
+#   http://localhost:50325             (if running as a native service)
+adsbrowser_endpoint: "http://localhost:50325"
+adsbrowser_api_port: "50325"
+
+# REQUIRED. The API key for the AdsPower Local API.
+# Provide via environment (WBPARSER_ADMIN_API_KEY is reused) or -e directly.
+# Both WBPARSER_ADMIN_API_KEY and adsbrowser_api_key are tried; the latter wins.
+adsbrowser_api_key: ""
+
+# Optional: a pre-created browser profile ID used for the headless launch
+# verification step. If empty the verification step is skipped.
+# Create a profile at https://www.adspower.com and paste the profile_id here.
+adsbrowser_test_profile_id: ""
+
+# --- Paths --------------------------------------------------------------------
+adsbrowser_config_dir: "/opt/adsbrowser"
+adsbrowser_log_dir: "/var/log/adsbrowser"
+adsbrowser_shell_rc: "/etc/profile.d/adsbrowser.sh"
+
+# --- Ownership ----------------------------------------------------------------
+adsbrowser_owner: root
+adsbrowser_group: root

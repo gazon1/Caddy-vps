@@ -60,6 +60,16 @@ caddy_inspect_format: >-
 caddy_route_src: ""
 caddy_route_name: ""
 
+# Rendered snippet, as an alternative to caddy_route_src.
+#
+# Set this when the snippet is produced by a Jinja template rather than checked
+# in as a literal file — a project role that owns its own variables has no
+# reason to write a static Caddyfile fragment to disk just to hand it over.
+# Exactly one of the two must be non-empty. `content` is rendered by Ansible on
+# the control node, so unlike `src` it cannot be a path that only exists
+# remotely.
+caddy_route_content: ""
+
 # --- Optional post-apply reachability probe ----------------------------------
 # `caddy validate` adapts the config; it does not exercise it. A snippet that
 # points at an upstream that does not resolve passes validation and then fails

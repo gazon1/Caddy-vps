@@ -1,0 +1,33 @@
+{# Rendered into roles/caddy/tasks/routes.yml via caddy_route_content, so the
+   upstream stays a variable instead of a path that has to exist on the control
+   node. #}
+{{ wbparser_hostname }} {
+    encode zstd gzip
+
+    # Liveness first: what the container's own healthcheck calls. Answering it
+    # here proves the route reaches the app without depending on the database.
+    @health-live path /api/health/live /actuator/health/liveness
+    reverse_proxy @health-live {{ wbparser_upstream }}
+
+    # Readiness includes the database check, so this 503s during a database blip.
+    # That is the honest answer and it is why the container's own healthcheck uses
+    # /live instead: a database outage should not restart the crawler and interrupt
+    # a crawl in progress.
+    @health-ready path /api/health/ready /actuator/health/readiness
+    reverse_proxy @health-ready {{ wbparser_upstream }}
+
+    # Prometheus metrics
+    @metrics path /metrics /actuator/prometheus
+    reverse_proxy @metrics {{ wbparser_upstream }}
+
+    # Everything else → the app
+    @api not path /metrics /actuator/*
+    reverse_proxy @api {{ wbparser_upstream }}
+
+    # Upstream is a container on {{ caddy_network }}, not 127.0.0.1: the crawler
+    # publishes no host port, so the proxy can only reach it across the network.
+    log {
+        output stderr
+        format json
+    }
+}

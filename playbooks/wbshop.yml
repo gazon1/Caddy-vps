@@ -1,311 +1,460 @@
 # ==============================================================================
-# Ansible playbook: deploy wbshop (product-catalog) after parser + migrations
+# Deploy wbshop (product-catalog) with parser + migrations.
 #
-# This playbook:
-#   1. Deploys/updates wb-parser container (if tag changed or not running)
-#   2. Waits for wb-parser to become healthy
-#   3. Runs Flyway migrations on the shared database (if needed)
-#   4. Deploys/updates product-catalog (wbshop) container
+# This playbook deploys in order:
+#   1. adsbrowser  — headless browser (if needed by parser)
+#   2. wbparser    — parser container, with rollback on failure
+#   3. Flyway      — baseline + migrate on shared DB (once, when needed)
+#   4. wbshop      — product-catalog container
+#   5. Caddy route — publish the route
 #
 # Usage:
-#   # Deploy with default settings (expects Caddy-vps structure):
-#   ansible-playbook playbooks/wbshop.yml -e "wbshop_tag=<git-sha>"
+#   just wbshop-deploy           # deploy current HEAD (from app repo)
+#   ansible-playbook playbooks/wbshop.yml -e "wbparser_tag=<sha>" -e "wbshop_tag=<sha>"
 #
-#   # Or with explicit paths:
-#   ansible-playbook playbooks/wbshop.yml \
-#     -e "wbshop_tag=<git-sha>" \
-#     -e "wbshop_compose_src=/path/to/docker-compose.vps.yml" \
-#     -e "wbparser_compose_src=/path/to/wb-parser/deploy/docker-compose.vps.yml"
+# Required environment / variables:
+#   wbparser_tag             — Docker image tag for parser
+#   wbshop_tag               — Docker image tag for wbshop
+#   WBPARSER_COMPOSE_SRC    — path to parser's deploy/docker-compose.vps.yml
+#   WBSHOP_COMPOSE_SRC      — path to wbshop's docker-compose.yml (optional, uses app.env)
+#   WBPARSER_DB_PASSWORD    — database password
+#   WBPARSER_ADMIN_PASSWORD — admin password
+#   WBPARSER_ADMIN_API_KEY  — admin API key
 #
-# Required env vars / Ansible variables:
-#   wbshop_tag          - Docker image tag for wbshop (commit SHA)
-#   wbparser_tag        - Docker image tag for wb-parser (default: same as wbshop_tag)
-#   wbshop_compose_src  - Path to wbshop docker-compose.vps.yml on local machine
-#   wbparser_compose_src - Path to wb-parser docker-compose.vps.yml on local machine
-#
-# The compose files are copied to the VPS by this playbook.
+# The Caddy-vps directory convention: roles own the logic, playbooks wire them.
 # ==============================================================================
 
----
-- name: Deploy wbshop (product-catalog) with parser and migrations
-  hosts: webservers
-  become: true
+- name: Deploy adsbrowser headless browser
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
   gather_facts: true
+
+  roles:
+    - role: adsbrowser
+      tags: [adsbrowser]
+
+- name: Deploy wb-parser crawler
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+
+  vars_files:
+    - "{{ playbook_dir }}/../roles/caddy/defaults/main.yml"
+
   vars:
-    # Default tags (can be overridden via -e)
-    wbshop_tag: "{{ lookup('env', 'TAG') | default('latest', true) }}"
-    wbparser_tag: "{{ wbshop_tag }}"
+    wbparser_compose_src: >-
+      {{ lookup('env', 'WBPARSER_COMPOSE_SRC') | default('', true) }}
+    caddy_route_name: "{{ wbparser_route_name }}"
+    caddy_route_url: "{{ wbparser_route_url }}"
 
-    # Paths on the VPS
-    vps_app_dir: /opt/wbshop
-    vps_parser_dir: /opt/wbparser
-    vps_caddy_dir: /opt/caddy
-
-    # Compose file sources (paths on the CONTROL MACHINE, not the VPS)
-    # These should be passed via -e when running from a different machine
-    wbshop_compose_src: ""
-    wbparser_compose_src: ""
-
-    # Shared database settings
-    db_host: "91.188.212.209"
-    db_port: 5432
-
-    # Image settings
-    wbshop_image: "ghcr.io/gazon1/product-catalog"
-    wbparser_image: "ghcr.io/gazon1/wb-parser"
+  roles:
+    - role: wbparser
+      tags: [wbparser]
 
   tasks:
-    # ==========================================================================
-    # PREFLIGHT: Validate inputs
-    # ==========================================================================
-    - name: Validate wbshop_tag is set
-      ansible.builtin.fail:
-        msg: "wbshop_tag must be set via -e wbshop_tag=<tag>"
-      when: wbshop_tag | length == 0 or wbshop_tag == 'latest'
+    - name: Render the wb-parser route snippet
+      ansible.builtin.set_fact:
+        caddy_route_content: >-
+          {{ lookup('ansible.builtin.template',
+                    playbook_dir ~ '/../roles/wbparser/templates/Caddyfile.snippet.j2') }}
+      when: wbparser_hostname | length > 0
+      tags: [caddy_routes]
 
-    - name: Validate compose files exist
-      ansible.builtin.stat:
-        path: "{{ item }}"
-      register: compose_files
-      failed_when: not compose_files.stat.exists
-      loop:
-        - "{{ wbshop_compose_src }}"
-        - "{{ wbparser_compose_src }}"
-      when: wbshop_compose_src | length > 0 and wbparser_compose_src | length > 0
+    - name: Apply the route
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../roles/caddy/tasks/routes.yml"
+      when: wbparser_hostname | length > 0
+      tags: [caddy_routes]
 
-    # ==========================================================================
-    # STEP 1: Deploy wb-parser
-    # ==========================================================================
-    - name: Ensure parser directories exist
+    - name: Remove the route
       ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        owner: root
-        group: root
-        mode: '0755'
-      loop:
-        - "{{ vps_parser_dir }}"
-        - "{{ vps_parser_dir }}/config"
+        path: "{{ caddy_conf_d }}/{{ wbparser_route_name }}.caddy"
+        state: absent
+      notify: Reload Caddy
+      when: wbparser_hostname | length == 0
+      tags: [caddy_routes]
 
-    - name: Copy wbparser docker-compose to VPS
-      ansible.builtin.copy:
-        src: "{{ wbparser_compose_src }}"
-        dest: "{{ vps_parser_dir }}/docker-compose.yml"
-        owner: root
-        group: root
-        mode: '0644'
-      when: wbparser_compose_src | length > 0
+  handlers:
+    - name: Reload Caddy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - caddy
+          - reload
+          - --config
+          - /etc/caddy/Caddyfile
+      changed_when: true
 
-    - name: Create parser .env file
-      ansible.builtin.template:
-        src: templates/wbparser-app.env.j2
-        dest: "{{ vps_parser_dir }}/app.env"
-        owner: root
-        group: root
-        mode: '0600'
-      no_log: true
+- name: Run Flyway migrations on the shared database
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+  tags: [flyway]
 
-    - name: Create parser .env file with TAG
-      ansible.builtin.copy:
-        dest: "{{ vps_parser_dir }}/.env"
-        content: |
-          TAG={{ wbparser_tag }}
-          IMAGE_OWNER=gazon1
-        owner: root
-        group: root
-        mode: '0644'
+  vars:
+    # Database on the shared DB host
+    flyway_db_host: "{{ wbparser_db_host }}"
+    flyway_db_port: "{{ wbparser_db_port }}"
+    flyway_db_name: "{{ wbparser_db_name }}"
+    flyway_db_user: "{{ wbparser_db_user }}"
+    flyway_db_password: "{{ lookup('env', 'WBPARSER_DB_PASSWORD') }}"
+    flyway_container: "wb-parser"
+    flyway_jar_path: "/app/app.jar"
 
-    - name: Check current wbparser container state
-      ansible.builtin.shell: |
-        docker inspect wb-parser --format '{{.Config.Image}}' 2>/dev/null || echo "not_found"
-      register: current_wbparser_image
+  tasks:
+    - name: Verify parser container is running
+      ansible.builtin.command:
+        argv: [docker, inspect, "{{ flyway_container }}"]
+      register: _flyway_parser_inspect
       changed_when: false
+      failed_when: _flyway_parser_inspect.rc != 0
 
-    - name: Pull new wbparser image
-      ansible.builtin.shell: |
-        docker pull {{ wbparser_image }}:{{ wbparser_tag }}
-      when: current_wbparser_image.stdout != "{{ wbparser_image }}:{{ wbparser_tag }}"
-
-    - name: Deploy wbparser via docker compose
-      ansible.builtin.shell: |
-        set -e
-        cd {{ vps_parser_dir }}
-        docker compose pull
-        docker compose up -d --remove-orphans
-      register: wbparser_deploy_result
-      failed_when: wbparser_deploy_result.rc not in [0, 0]
-
-    # ==========================================================================
-    # STEP 2: Wait for wb-parser to be healthy
-    # ==========================================================================
-    - name: Wait for wb-parser to become healthy
-      ansible.builtin.shell: |
-        docker inspect wb-parser --format '{{.State.Health.Status}}' 2>/dev/null || echo "none"
-      register: parser_health
-      until: parser_health.stdout == "healthy"
-      retries: 40
-      delay: 15
-      changed_when: false
-
-    - name: Verify wb-parser /live endpoint responds
-      ansible.builtin.wait_for:
-        url: "http://127.0.0.1:8080/api/health/live"
-        timeout: 30
-        state: present
-      ignore_errors: true
-
-    # ==========================================================================
-    # STEP 3: Run Flyway migrations (baseline if needed)
-    # ==========================================================================
     - name: Check if Flyway baseline is needed
-      ansible.builtin.shell: |
-        # Check if schema_version table exists and has entries
-        docker exec wb-parser java -cp \
-          "$(find /app -name 'app.jar' | head -1)" \
-          org.flywaydb.commandline.Main info 2>/dev/null | grep -c "Schema [0-9]* table" || echo "0"
-      register: flyway_info
+      block:
+        - name: Run Flyway info to check schema state
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ flyway_container }}"
+              - java
+              - -cp
+              - "{{ flyway_jar_path }}"
+              - org.flywaydb.commandline.Main
+              - info
+          register: _flyway_info
+          changed_when: false
+          failed_when: false
+
+        - name: Parse Flyway info output
+          ansible.builtin.set_fact:
+            _flyway_schema_count: "{{ _flyway_info.stdout_lines | select('search', 'Schema [^ ]* table') | list | length }}"
+
+        - name: Show current Flyway state
+          ansible.builtin.debug:
+            msg: "Flyway schema count: {{ _flyway_schema_count }}"
+      rescue:
+        - name: Report Flyway check failed
+          ansible.builtin.debug:
+            msg: "Flyway info failed — database may need baseline manually"
+
+    - name: Run Flyway baseline (for non-empty legacy schema)
+      when: _flyway_schema_count | default(0) | int == 0
+      block:
+        - name: Run Flyway baseline
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ flyway_container }}"
+              - java
+              - -cp
+              - "{{ flyway_jar_path }}"
+              - org.flywaydb.commandline.Main
+              - baseline
+              - -baselineVersion=1
+              - -baselineDescription="Legacy NET schema baseline"
+          register: _flyway_baseline
+          changed_when: true
+
+        - name: Show baseline result
+          ansible.builtin.debug:
+            msg: "{{ _flyway_baseline.stdout }}"
+
+        - name: Run Flyway migrate after baseline
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ flyway_container }}"
+              - java
+              - -cp
+              - "{{ flyway_jar_path }}"
+              - org.flywaydb.commandline.Main
+              - migrate
+          register: _flyway_migrate
+          changed_when: true
+
+        - name: Show migrate result
+          ansible.builtin.debug:
+            msg: "{{ _flyway_migrate.stdout }}"
+
+    - name: Run Flyway migrate (already baselined)
+      when: _flyway_schema_count | default(0) | int > 0
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ flyway_container }}"
+          - java
+          - -cp
+          - "{{ flyway_jar_path }}"
+          - org.flywaydb.commandline.Main
+          - migrate
+      register: _flyway_migrate
+      changed_when: true
+
+    - name: Show Flyway result
+      ansible.builtin.debug:
+        msg: "{{ _flyway_migrate.stdout }}"
+
+- name: Deploy wbshop (product-catalog)
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+  tags: [wbshop]
+
+  vars:
+    # Image
+    wbshop_registry: "ghcr.io"
+    wbshop_image_owner: "gazon1"
+    wbshop_image_name: "product-catalog"
+
+    # Paths on VPS
+    wbshop_base: "/opt/wbshop"
+    wbshop_compose_file: "{{ wbshop_base }}/docker-compose.yml"
+    wbshop_env_file: "{{ wbshop_base }}/.env"
+    wbshop_state_file: "{{ wbshop_base }}/.deployed-tag"
+    wbshop_app_env_file: "{{ wbshop_base }}/app.env"
+
+    # Compose source (control machine)
+    wbshop_compose_src: >-
+      {{ lookup('env', 'WBSHOP_COMPOSE_SRC') | default('', true) }}
+
+    # Container
+    wbshop_container_name: "product-catalog"
+
+    # Database (shared, read from crawler)
+    # These match the wbparser role defaults since wbshop reads the same DB
+    wbshop_db_host: "91.188.212.209"
+    wbshop_db_port: "5432"
+    wbshop_db_name: "wbparser"
+    wbshop_db_user: "catalog"
+    wbshop_db_password: "{{ lookup('env', 'WBPARSER_DB_PASSWORD') }}"
+
+    # Health gate
+    wbshop_health_timeout: 180
+    wbshop_health_retries: 20
+    wbshop_health_delay: 6
+
+    # Site URL (for canonical URLs, sitemap, etc.)
+    wbshop_site_url: "https://wb-parser.maxdrobin.ru"
+
+    # Ownership
+    wbshop_owner: root
+    wbshop_group: root
+
+    # Caddy route
+    wbshop_route_name: "product-catalog"
+    wbshop_hostname: "wb-parser.maxdrobin.ru"
+
+  tasks:
+    - name: Validate wbshop_tag is set
+      ansible.builtin.assert:
+        that:
+          - wbshop_tag | length > 0
+        fail_msg: >-
+          wbshop_tag is empty. Pass the tag:
+          ansible-playbook playbooks/wbshop.yml -e wbshop_tag=<sha>
+
+    - name: Check that compose source exists
+      ansible.builtin.set_fact:
+        _wbshop_compose_readable: >-
+          {{ lookup('ansible.builtin.file', wbshop_compose_src, errors='ignore')
+             | length > 0 }}
+      when: wbshop_compose_src | length > 0
+
+    - name: Read currently deployed tag
+      ansible.builtin.slurp:
+        src: "{{ wbshop_state_file }}"
+      register: _wbshop_state
       changed_when: false
       failed_when: false
 
-    - name: Run Flyway baseline (if schema is non-empty)
-      ansible.builtin.shell: |
-        set -e
-        JAR=$(find /app -name 'app.jar' | head -1)
-        echo "Running Flyway baseline..."
-        java -cp "$JAR" org.flywaydb.commandline.Main baseline \
-          -baselineVersion=1 \
-          -baselineDescription="NET schema baseline"
-        echo "Running Flyway migrate..."
-        java -cp "$JAR" org.flywaydb.commandline.Main migrate
-        echo "Migrations complete."
-      when: flyway_info.stdout|int == 0
-      register: flyway_baseline
-      failed_when: false
+    - name: Work out the previous tag
+      ansible.builtin.set_fact:
+        wbshop_previous_tag: >-
+          {{ _wbshop_state.content | b64decode | trim
+             if _wbshop_state.content is defined else '' }}
 
-    - name: Run Flyway migrate (if already baselined)
-      ansible.builtin.shell: |
-        set -e
-        JAR=$(find /app -name 'app.jar' | head -1)
-        echo "Running Flyway migrate..."
-        java -cp "$JAR" org.flywaydb.commandline.Main migrate
-        echo "Migrations complete."
-      when: flyway_info.stdout|int > 0
-      register: flyway_migrate
-      failed_when: false
-
-    - name: Show Flyway migration result
-      ansible.builtin.debug:
-        msg: "{{ flyway_baseline.stdout | default('') + flyway_migrate.stdout | default('No migration needed') }}"
-      when: flyway_baseline is defined or flyway_migrate is defined
-
-    # ==========================================================================
-    # STEP 4: Deploy wbshop (product-catalog)
-    # ==========================================================================
-    - name: Ensure wbshop directories exist
+    - name: Ensure deploy directory exists
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: "{{ wbshop_base }}"
         state: directory
-        owner: root
-        group: root
-        mode: '0755'
-      loop:
-        - "{{ vps_app_dir }}"
-        - "{{ vps_app_dir }}/config"
+        owner: "{{ wbshop_owner }}"
+        group: "{{ wbshop_group }}"
+        mode: "0755"
 
-    - name: Copy wbshop docker-compose to VPS
+    - name: Install the compose file
       ansible.builtin.copy:
         src: "{{ wbshop_compose_src }}"
-        dest: "{{ vps_app_dir }}/docker-compose.yml"
-        owner: root
-        group: root
-        mode: '0644'
+        dest: "{{ wbshop_compose_file }}"
+        owner: "{{ wbshop_owner }}"
+        group: "{{ wbshop_group }}"
+        mode: "0644"
       when: wbshop_compose_src | length > 0
 
-    - name: Copy wbshop .env file
+    - name: Render .env with TAG and IMAGE_OWNER
       ansible.builtin.copy:
-        src: "{{ vps_app_dir }}/.env"
-        dest: "{{ vps_app_dir }}/.env"
-        owner: root
-        group: root
-        mode: '0600'
-      when: wbshop_compose_src | length > 0
-      no_log: true
-
-    - name: Create wbshop .env with TAG
-      ansible.builtin.copy:
-        dest: "{{ vps_app_dir }}/.env"
+        dest: "{{ wbshop_env_file }}"
         content: |
           TAG={{ wbshop_tag }}
-          IMAGE_OWNER=gazon1
-        owner: root
-        group: root
-        mode: '0644'
+          IMAGE_OWNER={{ wbshop_image_owner }}
+        owner: "{{ wbshop_owner }}"
+        group: "{{ wbshop_group }}"
+        mode: "0644"
+
+    - name: Render app.env with DATABASE_URL
+      ansible.builtin.copy:
+        dest: "{{ wbshop_app_env_file }}"
+        content: |
+          DATABASE_URL=postgresql://{{ wbshop_db_user }}:{{ wbshop_db_password }}@{{ wbshop_db_host }}:{{ wbshop_db_port }}/{{ wbshop_db_name }}?sslmode=require
+          NEXT_PUBLIC_SITE_URL={{ wbshop_site_url }}
+        owner: "{{ wbshop_owner }}"
+        group: "{{ wbshop_group }}"
+        mode: "0600"
       no_log: true
 
-    - name: Check current wbshop container state
-      ansible.builtin.shell: |
-        docker inspect product-catalog --format '{{.Config.Image}}' 2>/dev/null || echo "not_found"
-      register: current_wbshop_image
-      changed_when: false
+    - name: Pull and start wbshop
+      block:
+        - name: Pull and start
+          community.docker.docker_compose_v2:
+            project_src: "{{ wbshop_base }}"
+            files:
+              - "{{ wbshop_compose_file | basename }}"
+            state: present
+            pull: always
+            wait: true
+            wait_timeout: "{{ wbshop_health_timeout }}"
+          register: _wbshop_up
 
-    - name: Pull new wbshop image
-      ansible.builtin.shell: |
-        docker pull {{ wbshop_image }}:{{ wbshop_tag }}
-      when: current_wbshop_image.stdout != "{{ wbshop_image }}:{{ wbshop_tag }}"
+        - name: Confirm container reports healthy
+          ansible.builtin.command:
+            argv: [docker, inspect, "{{ wbshop_container_name }}"]
+          register: _wbshop_inspect
+          changed_when: false
+          until: >-
+            (((_wbshop_inspect.stdout | from_json | first).State.Health) or {})
+            .get('Status', 'none') == 'healthy'
+          retries: "{{ wbshop_health_retries }}"
+          delay: "{{ wbshop_health_delay }}"
 
-    - name: Record previous wbshop image for rollback
-      ansible.builtin.shell: |
-        docker inspect product-catalog --format '{{index .Config.Image}}' 2>/dev/null \
-          > /tmp/product-catalog-prev-image || echo "unknown" > /tmp/product-catalog-prev-image
-        cat /tmp/product-catalog-prev-image
-      register: prev_image
-      changed_when: false
+        - name: Record the tag that is now running
+          ansible.builtin.copy:
+            content: "{{ wbshop_tag }}\n"
+            dest: "{{ wbshop_state_file }}"
+            owner: "{{ wbshop_owner }}"
+            group: "{{ wbshop_group }}"
+            mode: "0644"
 
-    - name: Deploy wbshop via docker compose
-      ansible.builtin.shell: |
-        set -e
-        cd {{ vps_app_dir }}
-        docker compose pull
-        docker compose up -d --remove-orphans
-      register: wbshop_deploy_result
+      rescue:
+        - name: Collect logs from failed container
+          ansible.builtin.command:
+            argv: [docker, logs, --tail, "40", "{{ wbshop_container_name }}"]
+          register: _wbshop_failed_logs
+          changed_when: false
+          failed_when: false
 
-    # ==========================================================================
-    # STEP 5: Wait for wbshop to be healthy
-    # ==========================================================================
-    - name: Wait for wbshop container to be healthy
-      ansible.builtin.shell: |
-        docker inspect product-catalog --format '{{.State.Health.Status}}' 2>/dev/null || echo "none"
-      register: wbshop_health
-      until: wbshop_health.stdout == "healthy"
-      retries: 20
-      delay: 15
-      changed_when: false
+        - name: Fail when no previous tag to rollback to
+          ansible.builtin.fail:
+            msg: >-
+              wbshop {{ wbshop_tag }} did not become healthy.
+              This is the first deploy — nothing to roll back to.
+              {{ '\n\nContainer logs:\n' }}
+              {{ _wbshop_failed_logs.stdout }}
+              {{ _wbshop_failed_logs.stderr }}
+          when: wbshop_previous_tag | length == 0
 
-    - name: Verify wbshop /api/health responds
-      ansible.builtin.wait_for:
-        url: "http://127.0.0.1:3000/api/health"
-        timeout: 60
-        state: present
+        - name: Restore previous tag
+          ansible.builtin.copy:
+            dest: "{{ wbshop_env_file }}"
+            content: |
+              TAG={{ wbshop_previous_tag }}
+              IMAGE_OWNER={{ wbshop_image_owner }}
+            owner: "{{ wbshop_owner }}"
+            group: "{{ wbshop_group }}"
+            mode: "0644"
 
-    # ==========================================================================
-    # SUMMARY
-    # ==========================================================================
-    - name: Show deployment summary
+        - name: Restart with previous tag
+          community.docker.docker_compose_v2:
+            project_src: "{{ wbshop_base }}"
+            files:
+              - "{{ wbshop_compose_file | basename }}"
+            state: present
+            pull: always
+            wait: true
+            wait_timeout: "{{ wbshop_health_timeout }}"
+
+        - name: Report rollback
+          ansible.builtin.fail:
+            msg: >-
+              wbshop {{ wbshop_tag }} did not become healthy.
+              Rolled back to {{ wbshop_previous_tag }}.
+              {{ '\n\nContainer logs:\n' }}
+              {{ _wbshop_failed_logs.stdout }}
+              {{ _wbshop_failed_logs.stderr }}
+
+    - name: Report what is deployed
       ansible.builtin.debug:
-        msg: |
-          ======================================================================
-          Deployment complete!
-          ======================================================================
-          wb-parser:    {{ wbparser_image }}:{{ wbparser_tag }}
-          product-catalog: {{ wbshop_image }}:{{ wbshop_tag }}
+        msg:
+          - "Image: {{ wbshop_registry }}/{{ wbshop_image_owner }}/{{ wbshop_image_name }}:{{ wbshop_tag }}"
+          - "Database: {{ wbshop_db_host }}:{{ wbshop_db_port }}/{{ wbshop_db_name }}"
+          - "Rollback target: {{ wbshop_previous_tag }}"
 
-          Previous wbshop image: {{ prev_image.stdout }}
+- name: Apply Caddy route for wbshop
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+  tags: [caddy_routes]
 
-          To rollback:
-            cd {{ vps_app_dir }} && \
-            export TAG=$(cat /tmp/product-catalog-prev-image | sed 's/.*://') && \
-            docker compose up -d
+  vars_files:
+    - "{{ playbook_dir }}/../roles/caddy/defaults/main.yml"
 
-          To check status:
-            ssh {{ ansible_user }}@{{ ansible_host }} "docker ps && docker compose -f {{ vps_app_dir }}/docker-compose.yml ps"
-          ======================================================================
+  vars:
+    caddy_route_name: "{{ wbshop_route_name | default('product-catalog') }}"
+    wbshop_hostname: "{{ wbshop_hostname | default('wb-parser.maxdrobin.ru') }}"
+
+  tasks:
+    - name: Render wbshop Caddy snippet
+      ansible.builtin.set_fact:
+        caddy_route_content: |
+          {{ wbshop_hostname }} {
+              encode gzip zstd
+
+              reverse_proxy product-catalog:3000 {
+                  header_up Host {host}
+                  header_up X-Real-IP {remote_host}
+                  flush_interval -1
+              }
+
+              header {
+                  X-Content-Type-Options "nosniff"
+                  Referrer-Policy "strict-origin-when-cross-origin"
+                  X-Frame-Options "DENY"
+                  Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+              }
+
+              log {
+                  output stdout
+                  format console
+              }
+          }
+      when: wbshop_hostname | length > 0
+
+    - name: Apply the route
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../roles/caddy/tasks/routes.yml"
+      when: wbshop_hostname | length > 0
+
+  handlers:
+    - name: Reload Caddy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - caddy
+          - reload
+          - --config
+          - /etc/caddy/Caddyfile
+      changed_when: true

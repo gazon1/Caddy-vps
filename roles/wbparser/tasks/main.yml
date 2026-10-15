@@ -1,0 +1,285 @@
+---
+# ==============================================================================
+# Deploy the wb-parser crawler container from a registry image.
+#
+#   just deploy                # in the app repo: gates, build, push, then this
+#   just wbparser-deploy -e wbparser_tag=<sha>
+#
+# What this role does NOT do, on purpose:
+#
+#   - it does not clone the repository or build anything. The host has no
+#     outbound network, so `git clone` and `./gradlew` both hang until they time
+#     out. The artifact arrives as an image pulled by tag.
+#   - it does not manage Caddy. The route is handed to roles/caddy/tasks/routes.yml
+#     by playbooks/wbparser.yml, which already does backup, validation, rollback
+#     and a reachability probe. A second copy of that logic here would be a
+#     second thing to keep in step.
+#   - it does not report success on a restart alone. The container must reach
+#     healthy, and if it does not, the previous tag is restored before the run
+#     fails. A deploy that restarts a container which dies 70 ms later is
+#     exactly the failure this gate exists to catch.
+# ==============================================================================
+
+# ── Preflight ────────────────────────────────────────────────────────────────
+# Secrets come from the environment, never from -e on a command line that ends
+# up in shell history and in the CI log. The app repo's `just deploy` documents
+# which ones are required.
+
+- name: Resolve secrets from the environment
+  ansible.builtin.set_fact:
+    _wbparser_db_password: "{{ lookup('env', 'WBPARSER_DB_PASSWORD') }}"
+    _wbparser_admin_password: "{{ lookup('env', 'WBPARSER_ADMIN_PASSWORD') }}"
+    _wbparser_admin_api_key: "{{ lookup('env', 'WBPARSER_ADMIN_API_KEY') }}"
+    wbparser_registry_user: "{{ lookup('env', 'WBPARSER_GHCR_USER') | default(wbparser_registry_user, true) }}"
+    wbparser_registry_token: "{{ lookup('env', 'WBPARSER_GHCR_TOKEN') | default(wbparser_registry_token, true) }}"
+  no_log: true
+
+- name: Refuse to deploy without a tag
+  ansible.builtin.assert:
+    that:
+      - wbparser_tag | length > 0
+    fail_msg: >-
+      wbparser_tag is empty. Pass the tag you pushed:
+      ansible-playbook playbooks/wbparser.yml -e wbparser_tag=$(git rev-parse --short HEAD)
+      There is no `latest` fallback on purpose — a deploy that forgot to name a
+      tag would ship whatever the registry considers newest.
+
+- name: Refuse to deploy without a database password
+  ansible.builtin.assert:
+    that:
+      - _wbparser_db_password | length > 0
+    fail_msg: >-
+      WBPARSER_DB_PASSWORD is not set in the environment.
+      WBPARSER_DB_PASSWORD='…' just wbparser-deploy
+
+- name: Refuse to deploy without an admin password
+  ansible.builtin.assert:
+    that:
+      - _wbparser_admin_password | length > 0
+    fail_msg: >-
+      WBPARSER_ADMIN_PASSWORD is not set in the environment. The application
+      ships an empty default for it, and an empty ADMIN_PASSWORD would leave the
+      admin API reachable with a credential nobody chose.
+      WBPARSER_ADMIN_PASSWORD='…' just wbparser-deploy
+
+# The compose file comes from the application repository. Checked with a lookup
+# rather than a delegated stat: delegate_to inherits the host's become, and
+# `-e ansible_become=true` outranks a task-level `become: false`, so a delegated
+# stat asks the control node for a sudo password it does not need.
+- name: Check that the compose source exists on the control node
+  ansible.builtin.set_fact:
+    _wbparser_compose_readable: >-
+      {{ lookup('ansible.builtin.file', wbparser_compose_src, errors='ignore')
+         | length > 0 }}
+  when: wbparser_compose_src | length > 0
+
+- name: Fail when the compose source is missing
+  ansible.builtin.fail:
+    msg: >-
+      wbparser_compose_src is not set or not readable on the control node
+      ({{ wbparser_compose_src | default('unset') }}). It must point at
+      deploy/docker-compose.vps.yml in the application checkout — the app repo
+      owns the runtime contract, this role only deploys it.
+  when: not (_wbparser_compose_readable | default(false) | bool)
+
+# Cheap, fails instantly, and separates "no DNS" from "the pull is slow" — both
+# of which otherwise look like one multi-minute hang.
+- name: Check that the registry is resolvable
+  ansible.builtin.command:
+    argv: [getent, hosts, "{{ wbparser_registry }}"]
+  register: _wbparser_dns
+  changed_when: false
+  failed_when: _wbparser_dns.rc != 0
+  ignore_errors: true
+
+- name: Fail early when the registry cannot be resolved
+  ansible.builtin.fail:
+    msg: >-
+      {{ wbparser_registry }} does not resolve on this host
+      (getent exit {{ _wbparser_dns.rc }}). The container cannot be pulled
+      without it — check DNS before anything else.
+  when: _wbparser_dns.rc != 0
+
+# ── Registry access ──────────────────────────────────────────────────────────
+# Only for a private package. An empty token is not an error: a public package,
+# or a host already logged in, needs nothing here — and forcing a login with an
+# empty credential would trade a working deploy for a failing one.
+
+- name: Log in to the registry
+  ansible.builtin.command:
+    argv:
+      - docker
+      - login
+      - "{{ wbparser_registry }}"
+      - --username
+      - "{{ wbparser_registry_user }}"
+      - --password-stdin
+    stdin: "{{ wbparser_registry_token }}"
+  no_log: true
+  when:
+    - wbparser_registry_user | length > 0
+    - wbparser_registry_token | length > 0
+  changed_when: true
+
+# ── Remember what is running now ──────────────────────────────────────────────
+# Read BEFORE .env is rewritten, because that file is what the rollback uses.
+
+- name: Read the currently deployed tag
+  ansible.builtin.slurp:
+    src: "{{ wbparser_state_file }}"
+  register: _wbparser_state
+  changed_when: false
+  failed_when: false
+
+- name: Work out the previous tag
+  ansible.builtin.set_fact:
+    wbparser_previous_tag: >-
+      {{ _wbparser_state.content | b64decode | trim
+         if _wbparser_state.content is defined else '' }}
+
+# ── Install the contract and its configuration ───────────────────────────────
+
+- name: Ensure the deploy directory exists
+  ansible.builtin.file:
+    path: "{{ wbparser_base }}"
+    state: directory
+    owner: "{{ wbparser_owner }}"
+    group: "{{ wbparser_group }}"
+    mode: "0755"
+
+- name: Install the compose file
+  ansible.builtin.copy:
+    src: "{{ wbparser_compose_src }}"
+    dest: "{{ wbparser_compose_file }}"
+    owner: "{{ wbparser_owner }}"
+    group: "{{ wbparser_group }}"
+    mode: "0644"
+
+# The tag written into .env is a variable of its own so the rollback can
+# re-render the same template with the previous value.
+- name: Render the image tag file
+  ansible.builtin.template:
+    src: wbparser.env.j2
+    dest: "{{ wbparser_env_file }}"
+    owner: "{{ wbparser_owner }}"
+    group: "{{ wbparser_group }}"
+    mode: "0644"
+  vars:
+    wbparser_env_tag: "{{ wbparser_tag }}"
+
+- name: Render the application environment file
+  ansible.builtin.template:
+    src: wbparser.app.env.j2
+    dest: "{{ wbparser_app_env_file }}"
+    owner: "{{ wbparser_owner }}"
+    group: "{{ wbparser_group }}"
+    mode: "0600"  # holds the database password and the admin credentials
+
+# ── Deploy, and put it back if it does not come up ───────────────────────────
+
+- name: Pull the image and start the container
+  block:
+
+    - name: Pull and start
+      community.docker.docker_compose_v2:
+        project_src: "{{ wbparser_base }}"
+        files:
+          - "{{ wbparser_compose_file | basename }}"
+        state: started
+        pull: always
+        wait: true
+        wait_timeout: "{{ wbparser_health_timeout }}"
+      register: _wbparser_up
+
+    # `wait` above already honours the container healthcheck. This repeats the
+    # check so a failure arrives as a sentence about health rather than as
+    # compose's exit status.
+    - name: Confirm the container reports healthy
+      ansible.builtin.command:
+        argv: [docker, inspect, "{{ wbparser_container_name }}"]
+      register: _wbparser_inspect
+      changed_when: false
+      until: >-
+        (((_wbparser_inspect.stdout | from_json | first).State.Health) or {})
+        .get('Status', 'none') == 'healthy'
+      retries: "{{ wbparser_health_retries }}"
+      delay: "{{ wbparser_health_delay }}"
+
+    - name: Record the tag that is now running
+      ansible.builtin.copy:
+        content: "{{ wbparser_tag }}\n"
+        dest: "{{ wbparser_state_file }}"
+        owner: "{{ wbparser_owner }}"
+        group: "{{ wbparser_group }}"
+        mode: "0644"
+
+  rescue:
+
+    # `docker logs` splits the container's own stdout and stderr across the
+    # command's stdout and stderr, so a capture that reads only one of them
+    # throws away half of what the application said.
+    - name: Collect the last log lines from the failed container
+      ansible.builtin.command:
+        argv: [docker, logs, --tail, "40", "{{ wbparser_container_name }}"]
+      register: _wbparser_failed_logs
+      changed_when: false
+      failed_when: false
+
+    # Nothing to go back to on a first deploy. Reported before the rollback
+    # steps, which would otherwise re-render an empty tag and start nothing.
+    - name: Report that there is nothing to roll back to
+      ansible.builtin.fail:
+        msg: >-
+          {{ wbparser_tag }} did not become healthy within
+          {{ wbparser_health_timeout }}s, and this is the first deploy on this
+          host — there is no previous tag to restore. The failed container is
+          left in place for inspection.
+          {{ '\n\nContainer logs:\n' }}
+          {{ (_wbparser_failed_logs.stdout | default('')) }}
+          {{ (_wbparser_failed_logs.stderr | default('')) }}
+      when: wbparser_previous_tag | length == 0
+
+    - name: Re-render the image tag file with the previous tag
+      ansible.builtin.template:
+        src: wbparser.env.j2
+        dest: "{{ wbparser_env_file }}"
+        owner: "{{ wbparser_owner }}"
+        group: "{{ wbparser_group }}"
+        mode: "0644"
+      vars:
+        wbparser_env_tag: "{{ wbparser_previous_tag }}"
+
+    # After the .env above, never before: compose reads the tag out of that file,
+    # so starting the container first would re-run the tag that just failed.
+    - name: Restore the previous tag
+      community.docker.docker_compose_v2:
+        project_src: "{{ wbparser_base }}"
+        files:
+          - "{{ wbparser_compose_file | basename }}"
+        state: started
+        pull: always
+        wait: true
+        wait_timeout: "{{ wbparser_health_timeout }}"
+      vars:
+        wbparser_env_tag: "{{ wbparser_previous_tag }}"
+
+    - name: Fail with what happened and what was done about it
+      ansible.builtin.fail:
+        msg: >-
+          {{ wbparser_tag }} did not become healthy within
+          {{ wbparser_health_timeout }}s. Rolled back to
+          {{ wbparser_previous_tag }}, which is what is running now.
+          {{ '\n\nContainer logs:\n' }}
+          {{ (_wbparser_failed_logs.stdout | default('')) }}
+          {{ (_wbparser_failed_logs.stderr | default('')) }}
+
+# ── Report ────────────────────────────────────────────────────────────────────
+
+- name: Report what is deployed
+  ansible.builtin.debug:
+    msg:
+      - "Image: {{ wbparser_registry }}/{{ wbparser_image_owner }}/{{ wbparser_image_name }}:{{ wbparser_tag }}"
+      - "Database: {{ wbparser_db_host }}:{{ wbparser_db_port }}/{{ wbparser_db_name }}"
+      - "Profile: {{ wbparser_profile }}"
+      - "Caddy route: {{ wbparser_hostname }} → {{ wbparser_upstream }}"
+      - "Rollback target: {{ wbparser_tag }}"

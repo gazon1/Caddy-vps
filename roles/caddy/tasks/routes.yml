@@ -21,12 +21,13 @@
           digits and dashes) so it cannot escape conf.d. Got
           '{{ caddy_route_name }}'.
 
-    - name: Require a snippet source
+    - name: Require a snippet source or rendered content
       ansible.builtin.assert:
         that:
-          - caddy_route_src | length > 0
+          - caddy_route_src | length > 0 or caddy_route_content | length > 0
         fail_msg: >-
-          Nothing to apply: set caddy_route_src to a Caddyfile fragment.
+          Nothing to apply: set caddy_route_src to a Caddyfile fragment, or
+          caddy_route_content to an already-rendered one.
 
     # caddy_route_src is a path on the CONTROL node, not on the target: the
     # "Install the snippet" copy below reads it from there. Checking it on the
@@ -45,13 +46,16 @@
         caddy_route_src_readable: >-
           {{ lookup('ansible.builtin.file', caddy_route_src, errors='ignore')
              | length > 0 }}
+      when: caddy_route_src | length > 0
 
     - name: Fail when the source snippet is missing
       ansible.builtin.fail:
         msg: >-
           Route snippet source not readable on the control node:
           {{ caddy_route_src }}
-      when: not caddy_route_src_readable | bool
+      when:
+        - caddy_route_src | length > 0
+        - not caddy_route_src_readable | bool
 
     - name: Verify the proxy container is running
       ansible.builtin.command:
@@ -91,8 +95,12 @@
       block:
 
         - name: Install the snippet
+          # `omit` rather than an empty string: copy rejects a task carrying both
+          # src and content, so whichever one this run does not use has to be
+          # absent from the arguments entirely.
           ansible.builtin.copy:
-            src: "{{ caddy_route_src }}"
+            src: "{{ caddy_route_src | default('', true) | default(omit, true) }}"
+            content: "{{ caddy_route_content | default('', true) | default(omit, true) }}"
             dest: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
             owner: "{{ caddy_owner }}"
             group: "{{ caddy_group }}"

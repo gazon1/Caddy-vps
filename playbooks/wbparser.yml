@@ -1,0 +1,97 @@
+---
+# Deploy the wb-parser crawler + adsbrowser headless browser on the VPS.
+#
+#   just deploy                          # in the app repo — builds, pushes, then runs this
+#   just wbparser-deploy -e wbparser_tag=<sha>           # full stack
+#   just wbparser-deploy -e wbparser_tag=<sha> --tags wbparser   # parser only, no route
+#   just adsbrowser-deploy -e adsbrowser_api_key=<key>    # adsbrowser only
+#
+# Role order and rationale:
+#
+#   1. adsbrowser  installs Xvfb, the adspower-browser CLI, starts the virtual
+#                display, and verifies a headless browser launch. Must run before
+#                the crawler if the crawler uses AdsPower for browser automation.
+#   2. wbparser   pulls the image, runs the container, health-gates it, and rolls
+#                back on failure.
+#   3. caddy routes.yml  publishes the route. Registering a route to a container
+#                that is not yet up would let Caddy forward into the void while
+#                caddy validate passes — which is exactly what this gate prevents.
+#
+# The AdsPower Local API must be running BEFORE adsbrowser tries to verify the
+# headless launch. On the VPS that is satisfied by the kotlin-try adspower
+# container:  cd /opt/kotlin-try && docker compose up -d adspower
+
+- name: Deploy adsbrowser headless browser
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+
+  roles:
+    - role: adsbrowser
+      tags: [adsbrowser]
+
+- name: Deploy wb-parser crawler
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+
+  vars_files:
+    # The caddy role's defaults, loaded without running the role. routes.yml needs
+    # caddy_conf_d, caddy_container, caddy_owner, caddy_group and friends, and
+    # re-declaring them here would be a second copy to keep in step with the role.
+    - "{{ playbook_dir }}/../roles/caddy/defaults/main.yml"
+
+  vars:
+    # Where deploy/docker-compose.vps.yml lives on the control node. `just deploy`
+    # passes this explicitly; the environment variable is the fallback for running
+    # this playbook by hand.
+    wbparser_compose_src: >-
+      {{ lookup('env', 'WBPARSER_COMPOSE_SRC') | default('', true) }}
+
+    caddy_route_name: "{{ wbparser_route_name }}"
+    # Validated against the same regex routes.yml enforces, before the import.
+    caddy_route_url: "{{ wbparser_route_url }}"
+
+  roles:
+    - role: wbparser
+      tags: [wbparser]
+
+  tasks:
+    - name: Render the wb-parser route snippet
+      ansible.builtin.set_fact:
+        caddy_route_content: >-
+          {{ lookup('ansible.builtin.template',
+                    playbook_dir ~ '/../roles/wbparser/templates/Caddyfile.snippet.j2') }}
+      when: wbparser_hostname | length > 0
+      tags: [caddy_routes]
+
+    - name: Apply the route
+      ansible.builtin.import_tasks: "{{ playbook_dir }}/../roles/caddy/tasks/routes.yml"
+      when: wbparser_hostname | length > 0
+      tags: [caddy_routes]
+
+    - name: Remove the route
+      ansible.builtin.file:
+        path: "{{ caddy_conf_d }}/{{ wbparser_route_name }}.caddy"
+        state: absent
+      notify: Reload Caddy
+      when: wbparser_hostname | length == 0
+      tags: [caddy_routes]
+
+  # Declared here because handlers are only loaded from roles that RUN, and the
+  # caddy role deliberately is not in this play — its tasks are imported one file
+  # at a time. The body is the same command as roles/caddy/handlers/main.yml; it
+  # is needed only for the route-removal path above, which has to reload Caddy
+  # after deleting the file.
+  handlers:
+    - name: Reload Caddy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ caddy_container }}"
+          - caddy
+          - reload
+          - --config
+          - /etc/caddy/Caddyfile
+      changed_when: true

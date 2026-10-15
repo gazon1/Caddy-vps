@@ -1,0 +1,92 @@
+---
+# Every value that can be overridden. Paths derived from wbparser_base follow it
+# automatically, so pointing the whole install somewhere else is a single -e.
+#
+# The crawler ships as an image in a registry, NOT as a jar built on this host:
+# the host has no outbound network, so it can neither clone the repository nor
+# resolve Gradle dependencies. `just deploy` builds and pushes locally and passes
+# the tag in with -e wbparser_tag=<sha>.
+
+# --- Image -------------------------------------------------------------------
+wbparser_registry: "ghcr.io"
+wbparser_image_owner: "gazon1"
+wbparser_image_name: "wb-parser"
+
+# REQUIRED. There is deliberately no `latest` fallback: a deploy that forgot to
+# set it would otherwise ship whatever the registry considers newest.
+wbparser_tag: ""
+
+# --- Where it lives on the host ----------------------------------------------
+wbparser_base: "/opt/wbparser"
+wbparser_compose_file: "{{ wbparser_base }}/docker-compose.vps.yml"
+
+# Two env files, on purpose — see deploy/docker-compose.vps.yml:
+#   .env     the image tag, which compose interpolates (so `$` in it expands)
+#   app.env  the credentials, passed through env_file (so `$` in them does not)
+wbparser_env_file: "{{ wbparser_base }}/.env"
+wbparser_app_env_file: "{{ wbparser_base }}/app.env"
+
+# The tag currently running, written on success. Read at the start of every
+# deploy so a failed one has something to roll back to.
+wbparser_state_file: "{{ wbparser_base }}/.deployed-tag"
+
+# The compose file is owned by the application repository — how the crawler runs
+# is the crawler's contract, and changes to it belong in review there. Point this
+# at deploy/docker-compose.vps.yml in that checkout; `just deploy` passes it.
+wbparser_compose_src: ""
+
+# --- Container ---------------------------------------------------------------
+wbparser_container_name: "wb-parser"
+
+# --- Application -------------------------------------------------------------
+# `worker` turns on the cron scheduler. `admin` and `public` leave it off.
+wbparser_profile: "worker"
+
+# Flyway is OFF here on purpose, and that is a debt, not a preference.
+#
+# The database this crawler reads has migration history this build does not
+# recognise: Flyway aborts startup with a checksum mismatch, so enabling it
+# would fail every deploy at the health gate. The proper resolution is an
+# explicit `flyway baseline` + `flyway migrate` against that database, one time,
+# by hand — after which this goes back to true and the schema has one owner.
+#
+# Until then the schema is whatever it already is, and a migration added to this
+# repository will NOT be applied by deploying.
+wbparser_flyway_enabled: "false"
+
+# Credentials for pulling a private image from the registry. Leave empty when the
+# package is public or the host is already logged in; the role skips the login
+# step rather than failing on an empty token.
+wbparser_registry_user: ""
+wbparser_registry_token: ""
+
+# --- Database ----------------------------------------------------------------
+# PostgreSQL lives on another host; the container reaches it over the network.
+wbparser_db_host: "91.188.212.209"
+wbparser_db_port: "5432"
+wbparser_db_name: "wbparser"
+wbparser_db_user: "postgres"
+
+# --- Caddy --------------------------------------------------------------------
+wbparser_hostname: "wb-parser.maxdrobin.ru"
+wbparser_route_name: "wbparser"
+
+# Container name on the shared network, NOT 127.0.0.1: the crawler publishes no
+# host port on purpose, so the proxy has to reach it over caddy_net.
+wbparser_upstream: "{{ wbparser_container_name }}:8080"
+
+# End-to-end probe run after the route is applied. caddy validate proves the
+# config loads, not that the upstream answers.
+wbparser_route_url: "https://{{ wbparser_hostname }}/api/health/live"
+
+# --- Health gate --------------------------------------------------------------
+# A restart is not a deploy: the container has to report healthy, and if it does
+# not, the previous tag is put back before this task fails.
+wbparser_health_timeout: 120
+wbparser_health_retries: 20
+wbparser_health_delay: 6
+
+# --- Ownership ---------------------------------------------------------------
+# /opt is root-owned; these run without become unless the playbook asks for it.
+wbparser_owner: root
+wbparser_group: root
