@@ -1,0 +1,311 @@
+# ==============================================================================
+# Ansible playbook: deploy wbshop (product-catalog) after parser + migrations
+#
+# This playbook:
+#   1. Deploys/updates wb-parser container (if tag changed or not running)
+#   2. Waits for wb-parser to become healthy
+#   3. Runs Flyway migrations on the shared database (if needed)
+#   4. Deploys/updates product-catalog (wbshop) container
+#
+# Usage:
+#   # Deploy with default settings (expects Caddy-vps structure):
+#   ansible-playbook playbooks/wbshop.yml -e "wbshop_tag=<git-sha>"
+#
+#   # Or with explicit paths:
+#   ansible-playbook playbooks/wbshop.yml \
+#     -e "wbshop_tag=<git-sha>" \
+#     -e "wbshop_compose_src=/path/to/docker-compose.vps.yml" \
+#     -e "wbparser_compose_src=/path/to/wb-parser/deploy/docker-compose.vps.yml"
+#
+# Required env vars / Ansible variables:
+#   wbshop_tag          - Docker image tag for wbshop (commit SHA)
+#   wbparser_tag        - Docker image tag for wb-parser (default: same as wbshop_tag)
+#   wbshop_compose_src  - Path to wbshop docker-compose.vps.yml on local machine
+#   wbparser_compose_src - Path to wb-parser docker-compose.vps.yml on local machine
+#
+# The compose files are copied to the VPS by this playbook.
+# ==============================================================================
+
+---
+- name: Deploy wbshop (product-catalog) with parser and migrations
+  hosts: webservers
+  become: true
+  gather_facts: true
+  vars:
+    # Default tags (can be overridden via -e)
+    wbshop_tag: "{{ lookup('env', 'TAG') | default('latest', true) }}"
+    wbparser_tag: "{{ wbshop_tag }}"
+
+    # Paths on the VPS
+    vps_app_dir: /opt/wbshop
+    vps_parser_dir: /opt/wbparser
+    vps_caddy_dir: /opt/caddy
+
+    # Compose file sources (paths on the CONTROL MACHINE, not the VPS)
+    # These should be passed via -e when running from a different machine
+    wbshop_compose_src: ""
+    wbparser_compose_src: ""
+
+    # Shared database settings
+    db_host: "91.188.212.209"
+    db_port: 5432
+
+    # Image settings
+    wbshop_image: "ghcr.io/gazon1/product-catalog"
+    wbparser_image: "ghcr.io/gazon1/wb-parser"
+
+  tasks:
+    # ==========================================================================
+    # PREFLIGHT: Validate inputs
+    # ==========================================================================
+    - name: Validate wbshop_tag is set
+      ansible.builtin.fail:
+        msg: "wbshop_tag must be set via -e wbshop_tag=<tag>"
+      when: wbshop_tag | length == 0 or wbshop_tag == 'latest'
+
+    - name: Validate compose files exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: compose_files
+      failed_when: not compose_files.stat.exists
+      loop:
+        - "{{ wbshop_compose_src }}"
+        - "{{ wbparser_compose_src }}"
+      when: wbshop_compose_src | length > 0 and wbparser_compose_src | length > 0
+
+    # ==========================================================================
+    # STEP 1: Deploy wb-parser
+    # ==========================================================================
+    - name: Ensure parser directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - "{{ vps_parser_dir }}"
+        - "{{ vps_parser_dir }}/config"
+
+    - name: Copy wbparser docker-compose to VPS
+      ansible.builtin.copy:
+        src: "{{ wbparser_compose_src }}"
+        dest: "{{ vps_parser_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      when: wbparser_compose_src | length > 0
+
+    - name: Create parser .env file
+      ansible.builtin.template:
+        src: templates/wbparser-app.env.j2
+        dest: "{{ vps_parser_dir }}/app.env"
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+
+    - name: Create parser .env file with TAG
+      ansible.builtin.copy:
+        dest: "{{ vps_parser_dir }}/.env"
+        content: |
+          TAG={{ wbparser_tag }}
+          IMAGE_OWNER=gazon1
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Check current wbparser container state
+      ansible.builtin.shell: |
+        docker inspect wb-parser --format '{{.Config.Image}}' 2>/dev/null || echo "not_found"
+      register: current_wbparser_image
+      changed_when: false
+
+    - name: Pull new wbparser image
+      ansible.builtin.shell: |
+        docker pull {{ wbparser_image }}:{{ wbparser_tag }}
+      when: current_wbparser_image.stdout != "{{ wbparser_image }}:{{ wbparser_tag }}"
+
+    - name: Deploy wbparser via docker compose
+      ansible.builtin.shell: |
+        set -e
+        cd {{ vps_parser_dir }}
+        docker compose pull
+        docker compose up -d --remove-orphans
+      register: wbparser_deploy_result
+      failed_when: wbparser_deploy_result.rc not in [0, 0]
+
+    # ==========================================================================
+    # STEP 2: Wait for wb-parser to be healthy
+    # ==========================================================================
+    - name: Wait for wb-parser to become healthy
+      ansible.builtin.shell: |
+        docker inspect wb-parser --format '{{.State.Health.Status}}' 2>/dev/null || echo "none"
+      register: parser_health
+      until: parser_health.stdout == "healthy"
+      retries: 40
+      delay: 15
+      changed_when: false
+
+    - name: Verify wb-parser /live endpoint responds
+      ansible.builtin.wait_for:
+        url: "http://127.0.0.1:8080/api/health/live"
+        timeout: 30
+        state: present
+      ignore_errors: true
+
+    # ==========================================================================
+    # STEP 3: Run Flyway migrations (baseline if needed)
+    # ==========================================================================
+    - name: Check if Flyway baseline is needed
+      ansible.builtin.shell: |
+        # Check if schema_version table exists and has entries
+        docker exec wb-parser java -cp \
+          "$(find /app -name 'app.jar' | head -1)" \
+          org.flywaydb.commandline.Main info 2>/dev/null | grep -c "Schema [0-9]* table" || echo "0"
+      register: flyway_info
+      changed_when: false
+      failed_when: false
+
+    - name: Run Flyway baseline (if schema is non-empty)
+      ansible.builtin.shell: |
+        set -e
+        JAR=$(find /app -name 'app.jar' | head -1)
+        echo "Running Flyway baseline..."
+        java -cp "$JAR" org.flywaydb.commandline.Main baseline \
+          -baselineVersion=1 \
+          -baselineDescription="NET schema baseline"
+        echo "Running Flyway migrate..."
+        java -cp "$JAR" org.flywaydb.commandline.Main migrate
+        echo "Migrations complete."
+      when: flyway_info.stdout|int == 0
+      register: flyway_baseline
+      failed_when: false
+
+    - name: Run Flyway migrate (if already baselined)
+      ansible.builtin.shell: |
+        set -e
+        JAR=$(find /app -name 'app.jar' | head -1)
+        echo "Running Flyway migrate..."
+        java -cp "$JAR" org.flywaydb.commandline.Main migrate
+        echo "Migrations complete."
+      when: flyway_info.stdout|int > 0
+      register: flyway_migrate
+      failed_when: false
+
+    - name: Show Flyway migration result
+      ansible.builtin.debug:
+        msg: "{{ flyway_baseline.stdout | default('') + flyway_migrate.stdout | default('No migration needed') }}"
+      when: flyway_baseline is defined or flyway_migrate is defined
+
+    # ==========================================================================
+    # STEP 4: Deploy wbshop (product-catalog)
+    # ==========================================================================
+    - name: Ensure wbshop directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - "{{ vps_app_dir }}"
+        - "{{ vps_app_dir }}/config"
+
+    - name: Copy wbshop docker-compose to VPS
+      ansible.builtin.copy:
+        src: "{{ wbshop_compose_src }}"
+        dest: "{{ vps_app_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      when: wbshop_compose_src | length > 0
+
+    - name: Copy wbshop .env file
+      ansible.builtin.copy:
+        src: "{{ vps_app_dir }}/.env"
+        dest: "{{ vps_app_dir }}/.env"
+        owner: root
+        group: root
+        mode: '0600'
+      when: wbshop_compose_src | length > 0
+      no_log: true
+
+    - name: Create wbshop .env with TAG
+      ansible.builtin.copy:
+        dest: "{{ vps_app_dir }}/.env"
+        content: |
+          TAG={{ wbshop_tag }}
+          IMAGE_OWNER=gazon1
+        owner: root
+        group: root
+        mode: '0644'
+      no_log: true
+
+    - name: Check current wbshop container state
+      ansible.builtin.shell: |
+        docker inspect product-catalog --format '{{.Config.Image}}' 2>/dev/null || echo "not_found"
+      register: current_wbshop_image
+      changed_when: false
+
+    - name: Pull new wbshop image
+      ansible.builtin.shell: |
+        docker pull {{ wbshop_image }}:{{ wbshop_tag }}
+      when: current_wbshop_image.stdout != "{{ wbshop_image }}:{{ wbshop_tag }}"
+
+    - name: Record previous wbshop image for rollback
+      ansible.builtin.shell: |
+        docker inspect product-catalog --format '{{index .Config.Image}}' 2>/dev/null \
+          > /tmp/product-catalog-prev-image || echo "unknown" > /tmp/product-catalog-prev-image
+        cat /tmp/product-catalog-prev-image
+      register: prev_image
+      changed_when: false
+
+    - name: Deploy wbshop via docker compose
+      ansible.builtin.shell: |
+        set -e
+        cd {{ vps_app_dir }}
+        docker compose pull
+        docker compose up -d --remove-orphans
+      register: wbshop_deploy_result
+
+    # ==========================================================================
+    # STEP 5: Wait for wbshop to be healthy
+    # ==========================================================================
+    - name: Wait for wbshop container to be healthy
+      ansible.builtin.shell: |
+        docker inspect product-catalog --format '{{.State.Health.Status}}' 2>/dev/null || echo "none"
+      register: wbshop_health
+      until: wbshop_health.stdout == "healthy"
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Verify wbshop /api/health responds
+      ansible.builtin.wait_for:
+        url: "http://127.0.0.1:3000/api/health"
+        timeout: 60
+        state: present
+
+    # ==========================================================================
+    # SUMMARY
+    # ==========================================================================
+    - name: Show deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ======================================================================
+          Deployment complete!
+          ======================================================================
+          wb-parser:    {{ wbparser_image }}:{{ wbparser_tag }}
+          product-catalog: {{ wbshop_image }}:{{ wbshop_tag }}
+
+          Previous wbshop image: {{ prev_image.stdout }}
+
+          To rollback:
+            cd {{ vps_app_dir }} && \
+            export TAG=$(cat /tmp/product-catalog-prev-image | sed 's/.*://') && \
+            docker compose up -d
+
+          To check status:
+            ssh {{ ansible_user }}@{{ ansible_host }} "docker ps && docker compose -f {{ vps_app_dir }}/docker-compose.yml ps"
+          ======================================================================
