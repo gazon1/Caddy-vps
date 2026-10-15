@@ -21,16 +21,7 @@
 # headless launch. On the VPS that is satisfied by the kotlin-try adspower
 # container:  cd /opt/kotlin-try && docker compose up -d adspower
 
-- name: Deploy adsbrowser headless browser
-  hosts: vps
-  become: "{{ ansible_become | default(false) }}"
-  gather_facts: true
-
-  roles:
-    - role: adsbrowser
-      tags: [adsbrowser]
-
-- name: Deploy wb-parser crawler
+- name: Deploy adsbrowser headless browser and wb-parser crawler
   hosts: vps
   become: "{{ ansible_become | default(false) }}"
   gather_facts: true
@@ -42,6 +33,8 @@
     - "{{ playbook_dir }}/../roles/caddy/defaults/main.yml"
 
   vars:
+    # Resolved at play level: explicit -e adsbrowser_api_key wins, else WBPARSER_ADMIN_API_KEY from env.
+
     # Where deploy/docker-compose.vps.yml lives on the control node. `just deploy`
     # passes this explicitly; the environment variable is the fallback for running
     # this playbook by hand.
@@ -53,6 +46,8 @@
     caddy_route_url: "{{ wbparser_route_url }}"
 
   roles:
+    - role: adsbrowser
+      tags: [adsbrowser]
     - role: wbparser
       tags: [wbparser]
 

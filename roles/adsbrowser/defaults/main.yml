@@ -3,8 +3,12 @@
 # Every value can be overridden with -e on the command line.
 # ==============================================================================
 
-# --- CLI version --------------------------------------------------------------
+# --- CLI version + integrity -------------------------------------------------
 adsbrowser_cli_version: "2.1.1"
+
+# sha256 of the tarball in files/. Updated automatically when the tarball changes:
+#   sha256sum roles/adsbrowser/files/adspower-browser-{{ adsbrowser_cli_version }}.tgz
+adsbrowser_tarball_sha256: "f19a451fa5bea9f8a2f4f3e2c60d42978db54cde9ba602f7ce6c7dcb6fe833e9"
 
 # --- AdsPower Local API -------------------------------------------------------
 # The endpoint where the AdsPower Local API is reachable.
@@ -15,8 +19,8 @@ adsbrowser_endpoint: "http://localhost:50325"
 adsbrowser_api_port: "50325"
 
 # REQUIRED. The API key for the AdsPower Local API.
-# Provide via environment (WBPARSER_ADMIN_API_KEY is reused) or -e directly.
-# Both WBPARSER_ADMIN_API_KEY and adsbrowser_api_key are tried; the latter wins.
+# Provide via -e adsbrowser_api_key=<key>, or set WBPARSER_ADMIN_API_KEY in the
+# environment. If neither is set, the role fails with a clear error.
 adsbrowser_api_key: ""
 
 # Optional: a pre-created browser profile ID used for the headless launch

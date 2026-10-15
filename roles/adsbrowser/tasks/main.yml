@@ -2,19 +2,21 @@
 # Install and verify the adsbrowser CLI on the VPS.
 #
 # What this role does:
-#   1. Installs Xvfb + supporting X11 libs (headless virtual display)
-#   2. Installs Node.js + npm from the system apt (no outbound network needed)
-#   3. Installs the adspower-browser npm package from a pre-packaged tarball
+#   1. Verifies the pre-packaged tarball integrity (sha256)
+#   2. Installs Xvfb + supporting X11 libs (headless virtual display)
+#   3. Installs Node.js + npm from the system apt (no outbound network needed)
+#   4. Installs the adspower-browser npm package from a pre-packaged tarball
 #      (the VPS has no outbound network, so npm install from registry is impossible)
-#   4. Starts Xvfb on display :99 and registers it as a systemd service
-#   5. Checks connectivity to the AdsPower Local API
-#   6. Verifies a headless browser launch (optional — requires a test profile ID)
+#   5. Registers Xvfb as a systemd service (enabled, not just started via shell)
+#   6. Pre-checks that the kotlin-try adspower container is reachable
+#   7. Checks connectivity to the AdsPower Local API
+#   8. Verifies a headless browser launch (optional — requires a test profile ID)
 #
 # Prerequisites:
 #   - The AdsPower Local API must already be running at
 #     adsbrowser_endpoint (default http://localhost:50325).
 #     The kotlin-try docker.adspower container satisfies this when co-located.
-#   - adsbrowser_api_key must be provided via the environment or -e.
+#   - adsbrowser_api_key must be provided via -e or resolved from WBPARSER_ADMIN_API_KEY.
 #
 # Usage (standalone):
 #   just adsbrowser-deploy -e adsbrowser_api_key=<key>
@@ -22,11 +24,11 @@
 # Usage (combined with wbparser — already wired in wbparser.yml):
 #   just wbparser-deploy -e wbparser_tag=<sha> -e adsbrowser_api_key=<key>
 #
-# NOTE: The adspower-browser tarball (files/adspower-browser-<ver>.tgz) is
-# maintained by the role maintainer. To update:
+# NOTE: To update the package:
 #   1. npm pack adspower-browser@<newver> --pack-destination /tmp/
-#   2. cp /tmp/adspower-browser-<newver>.tgz roles/adsbrowser/files/
-#   3. Update adsbrowser_cli_version in defaults/main.yml
+#   2. sha256sum /tmp/adspower-browser-<newver>.tgz
+#   3. cp /tmp/adspower-browser-<newver>.tgz roles/adsbrowser/files/
+#   4. Update adsbrowser_cli_version and adsbrowser_tarball_sha256 in defaults/main.yml
 # ==============================================================================
 
 - name: Gather facts
@@ -34,15 +36,23 @@
   when: ansible_facts == {}
 
 # ── Validate required inputs ───────────────────────────────────────────────────
+# Fix #2: Support WBPARSER_ADMIN_API_KEY from env as fallback when adsbrowser_api_key is empty.
+# Ansible precedence: -e var > role default. So if user passed -e adsbrowser_api_key=...,
+# it overrides this resolution; otherwise we try WBPARSER_ADMIN_API_KEY.
+
+- name: Resolve adsbrowser_api_key (fall back to WBPARSER_ADMIN_API_KEY env var)
+  ansible.builtin.set_fact:
+    adsbrowser_api_key: "{{ adsbrowser_api_key | default(lookup('env', 'WBPARSER_ADMIN_API_KEY') | default('', true), true) }}"
+  when: not (adsbrowser_api_key | default('') | length > 0)
 
 - name: Fail if adsbrowser_api_key is not provided
   ansible.builtin.assert:
     that:
       - adsbrowser_api_key | length > 0
     fail_msg: >-
-      adsbrowser_api_key is not set. Provide it via environment or -e:
+      adsbrowser_api_key is not set. Provide it via -e or set WBPARSER_ADMIN_API_KEY in the environment:
+        just wbparser-deploy -e wbparser_tag=<sha> -e adsbrowser_api_key=<key>
         WBPARSER_ADMIN_API_KEY=<key> just adsbrowser-deploy
-        (the same key is used for both the crawler admin API and AdsPower Local API)
 
 # ── OS-level dependencies ───────────────────────────────────────────────────────
 
@@ -82,11 +92,10 @@
     state: present
     update_cache: true
   become: true
-  register: _adsbrowser_nodejs_installed
 
 # ── Install adspower-browser CLI (offline — VPS has no outbound network) ───────
 
-- name: Check if adspower-browser is already installed
+- name: Check if adspower-browser is already installed and matches expected version
   ansible.builtin.command:
     argv: [ads, --version]
   register: _adsbrowser_already_installed
@@ -108,6 +117,7 @@
           not found. To update the package:
             npm pack adspower-browser@{{ adsbrowser_cli_version }} --pack-destination /tmp/
             cp /tmp/adspower-browser-{{ adsbrowser_cli_version }}.tgz roles/adsbrowser/files/
+          Then update adsbrowser_cli_version and adsbrowser_tarball_sha256 in defaults/main.yml
       when: not (_tarball_stat.stat.exists | default(false) | bool)
 
     - name: Copy tarball to VPS
@@ -115,6 +125,24 @@
         src: "{{ role_path }}/files/adspower-browser-{{ adsbrowser_cli_version }}.tgz"
         dest: /tmp/adspower-browser-{{ adsbrowser_cli_version }}.tgz
         mode: "0644"
+
+    # Fix #1: Verify sha256 of the copied tarball before installing
+    - name: Verify tarball integrity (sha256)
+      ansible.builtin.command:
+        argv: [sha256sum, "/tmp/adspower-browser-{{ adsbrowser_cli_version }}.tgz"]
+      register: _tarball_sha256
+      changed_when: false
+
+    - name: Fail when tarball sha256 does not match expected value
+      ansible.builtin.fail:
+        msg: >-
+          Tarball sha256 mismatch.
+          Expected: {{ adsbrowser_tarball_sha256 }}
+          Got:      {{ _tarball_sha256.stdout | trim | split | last }}
+          The tarball on the control node is corrupted or has been replaced without
+          updating adsbrowser_tarball_sha256 in defaults/main.yml.
+      when: >-
+        (_tarball_sha256.stdout | trim | split | last) != adsbrowser_tarball_sha256
 
     - name: Install adspower-browser from tarball
       ansible.builtin.command:
@@ -141,13 +169,16 @@
 
 # ── Environment configuration ──────────────────────────────────────────────────
 
-- name: Ensure adsbrowser config directory exists
+- name: Ensure adsbrowser directories exist
   ansible.builtin.file:
-    path: "{{ adsbrowser_config_dir }}"
+    path: "{{ item }}"
     state: directory
     owner: "{{ adsbrowser_owner }}"
     group: "{{ adsbrowser_group }}"
     mode: "0755"
+  loop:
+    - "{{ adsbrowser_config_dir }}"
+    - "{{ adsbrowser_log_dir }}"
 
 - name: Install adsbrowser environment file
   ansible.builtin.template:
@@ -167,32 +198,9 @@
     mode: "0644"
   become: true
 
-# ── Virtual display (Xvfb) for headless operation ─────────────────────────────
+# ── Xvfb as a proper systemd service (fixes #3, #4, #10) ───────────────────────
 
-- name: Start Xvfb on display :99
-  ansible.builtin.shell: |
-    # Clean up any stale locks from previous runs
-    rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
-
-    # Start Xvfb if not already running on :99
-    if ! pgrep -f "Xvfb :99" > /dev/null 2>&1; then
-        Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset \
-            >> {{ adsbrowser_log_dir }}/xvfb.log 2>&1 &
-        sleep 2
-        echo "Xvfb started on :99"
-    else
-        echo "Xvfb already running on :99"
-    fi
-
-    # Verify DISPLAY is set
-    export DISPLAY=:99
-    echo "DISPLAY=$DISPLAY"
-  args:
-    executable: bash
-  register: _adsbrowser_xvfb_start
-  changed_when: "'Xvfb started' in _adsbrowser_xvfb_start.stdout"
-
-- name: Add Xvfb to systemd startup (if not already present)
+- name: Deploy Xvfb systemd unit
   ansible.builtin.copy:
     dest: /etc/systemd/system/xvfb.service
     content: |
@@ -204,6 +212,7 @@
       [Service]
       Type=forking
       ExecStartPre=/bin/rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+      # Start Xvfb, redirect stdout/stderr to the role's log dir
       ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset
       ExecStartPost=/bin/sleep 2
       RemainAfterExit=yes
@@ -218,33 +227,83 @@
   become: true
   notify: Reload systemd
 
-# ── AdsPower Local API connectivity check ──────────────────────────────────────
+- name: Ensure Xvfb is enabled and started via systemd
+  ansible.builtin.systemd:
+    name: xvfb
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+
+# Fix #7: Deploy logrotate configuration for xvfb and adsbrowser logs
+- name: Deploy logrotate config for adsbrowser logs
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/adsbrowser
+    content: |
+      {{ adsbrowser_log_dir }}/*.log {
+          weekly
+          rotate 4
+          compress
+          delaycompress
+          missingok
+          notifempty
+          create 0644 root root
+      }
+    mode: "0644"
+  become: true
+
+# ── Pre-check: kotlin-try adspower container must be running (fix #6) ────────────
+
+- name: Check if kotlin-try adspower container is running
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "--format={{ '{{.State.Status}}' }}"
+      - adspower
+  register: _adspower_container_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail when kotlin-try adspower container is not running
+  ansible.builtin.fail:
+    msg: >-
+      The 'adspower' container is not running on this VPS.
+      Adsbrowser needs the AdsPower Local API to verify headless operation.
+      Start it with:
+        cd /opt/kotlin-try && docker compose -f docker-compose.prod.yml up -d adspower
+      Or, if kotlin-try is not on this VPS, ensure the AdsPower Local API
+      is reachable at {{ adsbrowser_endpoint }}.
+  when: _adspower_container_check.rc != 0 or _adspower_container_check.stdout | trim != 'running'
+
+# ── AdsPower Local API connectivity check (fix #5 — hard failure) ────────────────
 
 - name: Check if AdsPower Local API is reachable
   ansible.builtin.command:
     argv: [ads, check-status, -k, "{{ adsbrowser_api_key }}", -p, "{{ adsbrowser_api_port }}"]
   register: _adsbrowser_api_check
   changed_when: false
-  failed_when: false
+  # FIX #5: Removed failed_when: false — a non-zero exit IS a failure
 
 - name: Report AdsPower Local API status
   ansible.builtin.debug:
-    msg: "AdsPower Local API check: {{ _adsbrowser_api_check.stdout | default(_adsbrowser_api_check.stderr) | trim }}"
+    msg: "AdsPower Local API: {{ _adsbrowser_api_check.stdout | default(_adsbrowser_api_check.stderr) | trim }}"
+  when: _adsbrowser_api_check.rc == 0
 
 - name: Fail when AdsPower Local API is not reachable
   ansible.builtin.fail:
     msg: >-
-      AdsPower Local API is not reachable at {{ adsbrowser_endpoint }}.
-      The API must be running before adsbrowser can launch browsers.
-      On this VPS, start the kotlin-try docker.adspower container:
+      AdsPower Local API is not reachable at {{ adsbrowser_endpoint }}:{{ adsbrowser_api_port }}.
+      Exit code: {{ _adsbrowser_api_check.rc }}
+      Output: {{ _adsbrowser_api_check.stdout | default('') | trim }}
+      Stderr: {{ _adsbrowser_api_check.stderr | default('') | trim }}
+
+      Ensure the kotlin-try adspower container is running:
         cd /opt/kotlin-try && docker compose -f docker-compose.prod.yml up -d adspower
-      Or deploy the adspower container separately.
   when: _adsbrowser_api_check.rc != 0
 
 # ── Headless browser launch verification ──────────────────────────────────────
-# A real profile is needed for this step. We use adsbrowser_test_profile_id
-# which the operator should pre-create. If it is empty, this step is skipped
-# with a warning rather than a hard failure — no profile means no launch to verify.
+# Fix #10: Replaced shell/command guessing with proper deterministic checks.
 
 - name: Check if test profile is configured
   ansible.builtin.set_fact:
@@ -254,7 +313,7 @@
   when: _adsbrowser_has_test_profile | bool
   block:
 
-    - name: Open browser profile in headless mode (verification run)
+    - name: Open browser profile in headless mode
       ansible.builtin.command:
         argv:
           - ads
@@ -267,11 +326,10 @@
           - --headless
           - "1"
       register: _adsbrowser_headless_open
-      failed_when: false
       changed_when: true
       timeout: 60
 
-    - name: Verify headless browser is listed as open
+    - name: Poll until browser appears as open (up to 30s)
       ansible.builtin.command:
         argv:
           - ads
@@ -282,7 +340,10 @@
           - "{{ adsbrowser_api_port }}"
       register: _adsbrowser_opened_check
       changed_when: false
-      failed_when: false
+      until: _adsbrowser_opened_check.stdout | regex_search(adsbrowser_test_profile_id) | length > 0
+      retries: 10
+      delay: 3
+      when: _adsbrowser_headless_open.rc == 0
 
     - name: Close the verification browser
       ansible.builtin.command:
@@ -294,8 +355,6 @@
           - "{{ adsbrowser_api_key }}"
           - -p
           - "{{ adsbrowser_api_port }}"
-      register: _adsbrowser_close
-      failed_when: false
       changed_when: true
       when: _adsbrowser_has_test_profile | bool
 
@@ -305,16 +364,16 @@
           - "_adsbrowser_headless_open.rc == 0"
         fail_msg: >-
           Headless browser launch failed (exit {{ _adsbrowser_headless_open.rc }}).
-          Output: {{ _adsbrowser_headless_open.stdout | default('') | trim }}
-          Stderr: {{ _adsbrowser_headless_open.stderr | default('') | trim }}
+          stdout: {{ _adsbrowser_headless_open.stdout | default('') | trim }}
+          stderr: {{ _adsbrowser_headless_open.stderr | default('') | trim }}
       when: _adsbrowser_has_test_profile | bool
 
 - name: Warn when no test profile is configured
   ansible.builtin.debug:
     msg: >-
-      adsbrowser_test_profile_id is not set — skipping the headless launch
-      verification. To verify headless operation, set a real profile ID:
-        just adsbrowser-deploy -e adsbrowser_test_profile_id=kxpu63n
+      adsbrowser_test_profile_id is not set — skipping headless launch verification.
+      To verify headless operation end-to-end:
+        just adsbrowser-deploy -e adsbrowser_api_key=<key> -e adsbrowser_test_profile_id=kxpu63n
   when: not (_adsbrowser_has_test_profile | default(false) | bool)
 
 # ── Final report ───────────────────────────────────────────────────────────────
@@ -322,9 +381,8 @@
 - name: Report adsbrowser setup status
   ansible.builtin.debug:
     msg:
-      - "adspower-browser CLI : installed (version above)"
-      - "Xvfb                  : running on :99 (systemd service registered)"
-      - "DISPLAY               : :99 (headless X11)"
-      - "AdsPower API          : {{ adsbrowser_endpoint }}"
-      - "API port              : {{ adsbrowser_api_port }}"
+      - "adspower-browser CLI : {{ _adsbrowser_version_check.stdout | default('unknown') | trim }}"
+      - "Xvfb systemd service : enabled + started (display :99)"
+      - "DISPLAY               : :99"
+      - "AdsPower API          : {{ adsbrowser_endpoint }}:{{ adsbrowser_api_port }}"
       - "Headless verification : {{ 'passed' if _adsbrowser_has_test_profile | default(false) | bool else 'skipped (no test profile)' }}"

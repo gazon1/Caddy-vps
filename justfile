@@ -108,6 +108,7 @@ wbparser-deploy *args:
 #
 # Required:
 #   adsbrowser_api_key   AdsPower Local API key (same as WBPARSER_ADMIN_API_KEY)
+#   WBPARSER_ADMIN_API_KEY is auto-resolved if adsbrowser_api_key is not set.
 #
 # Optional:
 #   adsbrowser_test_profile_id   pre-created profile ID for the headless launch test
@@ -118,6 +119,17 @@ wbparser-deploy *args:
 adsbrowser-deploy *args:
     #!/usr/bin/env bash
     ansible-playbook "{{ REPO }}/playbooks/wbparser.yml" --tags adsbrowser {{ args }}
+
+# ---- ADSBROWSER CLEANUP ----
+# Remove adsbrowser from the VPS: stop Xvfb, disable service, uninstall CLI, purge config.
+# Does NOT remove the kotlin-try adspower container.
+#
+#   just adsbrowser-cleanup
+#   just adsbrowser-cleanup --check  # dry-run first
+[doc("Stop Xvfb, uninstall adspower-browser, purge adsbrowser config")]
+adsbrowser-cleanup *args:
+    #!/usr/bin/env bash
+    ansible-playbook "{{ REPO }}/playbooks/adsbrowser-cleanup.yml" {{ args }}
 
 # ---- LOCAL VERIFICATION ----
 [doc("Run the local lab suite against Docker (does not touch the VPS)")]
