@@ -263,7 +263,13 @@
         _wbshop_compose_readable: >-
           {{ lookup('ansible.builtin.file', wbshop_compose_src, errors='ignore')
              | length > 0 }}
-      when: wbshop_compose_src | length > 0
+
+    - name: Fail when compose source is missing
+      ansible.builtin.fail:
+        msg: >-
+          wbshop_compose_src is not set or not readable.
+          Set it with: -e wbshop_compose_src=/path/to/docker-compose.yml
+      when: not (_wbshop_compose_readable | default(false) | bool)
 
     - name: Read currently deployed tag
       ansible.builtin.slurp:

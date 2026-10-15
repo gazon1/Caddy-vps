@@ -112,6 +112,63 @@ project, so a site without a domain can sit next to one that has it.
 | `just route <name> <file>` | apply one route snippet, with backup and rollback |
 | `just status` | read-only: container, config validity, routes, modules |
 | `just lab-test` | prove all of the above locally, without touching the VPS |
+| `just wbshop-deploy` | deploy full wbshop stack: adsbrowser → parser → migrations → wbshop |
+
+## Deploying wbshop (full stack)
+
+The `wbshop.yml` playbook deploys in order:
+1. **adsbrowser** — headless browser for parser automation
+2. **wbparser** — parser container with rollback on failure
+3. **Flyway** — baseline + migrate on shared database
+4. **wbshop** — product-catalog container
+5. **Caddy route** — publish the route
+
+**When to use this:**
+- Need to update the parser (wbparser)
+- Need to run database migrations
+- First-time setup of the full stack
+
+**For wbshop-only updates** (no parser, no migrations), use the GitHub Actions
+"Deploy to VPS" workflow in the wbshop repository instead.
+
+### Usage
+
+```bash
+# From the wbshop repository:
+just ansible-deploy <tag>
+
+# Or from Caddy-vps directly:
+cd ~/Caddy-vps
+just wbshop-deploy \
+    -e "wbparser_tag=<sha>" \
+    -e "wbshop_tag=<sha>" \
+    -e "wbparser_compose_src=/path/to/wb-parser/deploy/docker-compose.vps.yml" \
+    -e "wbshop_compose_src=/path/to/wbshop/docker-compose.yml"
+```
+
+### Required environment variables
+
+```bash
+export WBPARSER_DB_PASSWORD="..."       # PostgreSQL password
+export WBPARSER_ADMIN_PASSWORD="..."   # Parser admin password
+export WBPARSER_ADMIN_API_KEY="..."    # Parser API key
+```
+
+### Tags
+
+```bash
+# Full stack (all plays)
+just wbshop-deploy -e "wbparser_tag=<sha>" -e "wbshop_tag=<sha>"
+
+# Flyway migrations only
+just wbshop-deploy --tags flyway ...
+
+# wbshop only (no parser)
+just wbshop-deploy --tags wbshop ...
+
+# Dry-run
+just wbshop-deploy ... -- --check --diff
+```
 
 ## Configuration
 
