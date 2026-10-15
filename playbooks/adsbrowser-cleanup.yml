@@ -1,0 +1,77 @@
+---
+# Remove adsbrowser from the VPS: stop Xvfb, uninstall adspower-browser, purge config.
+#
+#   just adsbrowser-cleanup
+#   just adsbrowser-cleanup --check  # dry-run first
+#
+# This does NOT remove the kotlin-try adspower container — that belongs to
+# kotlin-try, not to adsbrowser. The kotlin-try docker-compose is managed
+# separately.
+
+- name: Cleanup adsbrowser from the VPS
+  hosts: vps
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+
+  tasks:
+
+    - name: Stop and disable Xvfb systemd service
+      ansible.builtin.systemd:
+        name: xvfb
+        enabled: false
+        state: stopped
+      become: true
+      failed_when: false
+      changed_when: true
+
+    - name: Remove Xvfb systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/xvfb.service
+        state: absent
+      become: true
+      changed_when: true
+      notify: Reload systemd
+
+    - name: Remove logrotate config
+      ansible.builtin.file:
+        path: /etc/logrotate.d/adsbrowser
+        state: absent
+      become: true
+      changed_when: true
+
+    - name: Uninstall adspower-browser npm package
+      ansible.builtin.command:
+        argv: [npm, uninstall, -g, "adspower-browser@{{ adsbrowser_cli_version | default('2.1.1') }}"]
+      become: true
+      register: _adsbrowser_uninstall
+      failed_when: false
+      changed_when: true
+
+    - name: Remove adsbrowser config directory
+      ansible.builtin.file:
+        path: "{{ adsbrowser_config_dir | default('/opt/adsbrowser') }}"
+        state: absent
+      changed_when: true
+
+    - name: Remove adsbrowser shell rc snippet
+      ansible.builtin.file:
+        path: /etc/profile.d/adsbrowser.sh
+        state: absent
+      become: true
+      changed_when: true
+
+    - name: Remove adsbrowser log directory
+      ansible.builtin.file:
+        path: "{{ adsbrowser_log_dir | default('/var/log/adsbrowser') }}"
+        state: absent
+      changed_when: true
+
+    - name: Report cleanup completed
+      ansible.builtin.debug:
+        msg: "Adsbrowser cleanup complete. Xvfb stopped, adspower-browser removed, config purged."
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      become: true
