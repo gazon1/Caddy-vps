@@ -10,11 +10,11 @@
 #   T2  — preflight assertions reject a missing DB password
 #   T3  — preflight assertions reject a missing admin password
 #   T4  — a tag is resolved to a digest, and the digest is what .env and the
-#         state file carry
+#         state file carry — for the crawler AND for the browser runtime
 #   T5  — a second run changes nothing (idempotent)
 #   T6  — the legacy .deployed-tag is migrated into the digest state file
 #   T7  — an image that does not come up healthy rolls back to the previous
-#         digest
+#         digest — for both images
 #   T8  — a tag that cannot be resolved fails loudly and changes nothing
 #
 # The images come from a throwaway registry on localhost, not from GHCR: the
@@ -36,7 +36,9 @@ LAB_NETWORK="wbparser_net_lab"
 LAB_REGISTRY="localhost:5000"
 LAB_REGISTRY_CONTAINER="wbparser-lab-registry"
 LAB_REPO="lab/wb-parser"
+LAB_BROWSER_REPO="lab/wb-parser-adspower"
 LAB_CONTAINER="wb-parser-lab"
+LAB_BROWSER_CONTAINER="wb-parser-browser-lab"
 LAB_COMPOSE="$LAB_BASE/docker-compose.lab.yml"
 LAB_DB_PASSWORD="labtest123"
 LAB_ADMIN_PASSWORD="lab-admin-secret"
@@ -62,7 +64,7 @@ fail() {
 info() { printf '\033[0;36m  → %s\033[0m\n' "$1"; }
 
 teardown() {
-    docker rm -f "$LAB_CONTAINER" "$LAB_REGISTRY_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f "$LAB_CONTAINER" "$LAB_BROWSER_CONTAINER" "$LAB_REGISTRY_CONTAINER" >/dev/null 2>&1 || true
     docker network rm "$LAB_NETWORK" >/dev/null 2>&1 || true
     rm -rf "$LAB_BASE" >/dev/null 2>&1 || true
 }
@@ -83,10 +85,12 @@ LAB_ARGS=(
     -e "wbparser_registry=$LAB_REGISTRY"
     -e "wbparser_image_owner=lab"
     -e "wbparser_image_name=wb-parser"
+    -e "wbparser_browser_image_name=wb-parser-adspower"
     -e "wbparser_compose_src=$LAB_COMPOSE"
     -e "wbparser_compose_file=$LAB_COMPOSE"
     -e "wbparser_base=$LAB_BASE"
     -e "wbparser_container_name=$LAB_CONTAINER"
+    -e "wbparser_browser_container_name=$LAB_BROWSER_CONTAINER"
     -e "wbparser_hostname="
     -e "wbparser_registry_user="
     -e "wbparser_registry_token="
@@ -130,6 +134,18 @@ build_stub() {
     docker push -q "$LAB_REGISTRY/$LAB_REPO:$tag" >/dev/null
 }
 
+# The browser runtime: a second image, in a second repository, published under
+# the same tag — which is the production contract. The label makes the two
+# tags DIFFERENT images, so the two digests differ, so the rollback of the
+# browser digest is a real rollback and not a no-op.
+build_browser_stub() {
+    local tag="$1"
+    printf '%s\n%s\n' 'FROM alpine:3' 'CMD ["sh","-c","sleep 3600"]' > "$LAB_BASE/img/Dockerfile"
+    docker build -q --label "lab.tag=$tag" \
+        -t "$LAB_REGISTRY/$LAB_BROWSER_REPO:$tag" "$LAB_BASE/img" >/dev/null
+    docker push -q "$LAB_REGISTRY/$LAB_BROWSER_REPO:$tag" >/dev/null
+}
+
 docker image inspect alpine:3 >/dev/null 2>&1 || docker pull alpine:3 >/dev/null
 # The CMD is JSON in the Dockerfile: `\\r\\n` reaches the shell as `\r\n`, and
 # the shell's printf turns that into the CRLF an HTTP response needs.
@@ -137,10 +153,14 @@ build_stub "$LAB_TAG_GOOD" \
     '["sh","-c","while true; do printf '"'"'HTTP/1.1 200 OK\\r\\nContent-Length: 3\\r\\nConnection: close\\r\\n\\r\\nok\\n'"'"' | nc -l -p 8080; done"]'
 build_stub "$LAB_TAG_BAD" \
     '["sh","-c","sleep 3600"]'
+build_browser_stub "$LAB_TAG_GOOD"
+build_browser_stub "$LAB_TAG_BAD"
 
 # The compose file the role copies verbatim. It mirrors the contract of the
-# application repository's compose file: the image is named by DIGEST, and
-# DIGEST is required — there is no tag and no `latest` to fall back to.
+# application repository's compose file: the images are named by DIGEST, and
+# DIGEST is required — there is no tag and no `latest` to fall back to. The
+# browser service is there too, sharing the crawler's network namespace, which
+# is what makes the AdsPower Local API reachable at 127.0.0.1 inside it.
 cat > "$LAB_COMPOSE" <<'COMPOSE'
 services:
   wb-parser:
@@ -156,6 +176,14 @@ services:
     networks:
       - lab_net
 
+  wb-parser-browser:
+    image: localhost:5000/${IMAGE_OWNER:-lab}/wb-parser-adspower@${BROWSER_DIGEST:?BROWSER_DIGEST must be set to a sha256 digest}
+    container_name: wb-parser-browser-lab
+    restart: unless-stopped
+    network_mode: "service:wb-parser"
+    env_file:
+      - browser.env
+
 networks:
   lab_net:
     name: wbparser_net_lab
@@ -163,14 +191,18 @@ networks:
 COMPOSE
 
 digest_of() {
-    docker buildx imagetools inspect "$LAB_REGISTRY/$LAB_REPO:$1" \
+    docker buildx imagetools inspect "$LAB_REGISTRY/$1:$2" \
         --format '{{.Manifest.Digest}}' 2>/dev/null | tr -d '[:space:]'
 }
 
-GOOD_DIGEST="$(digest_of "$LAB_TAG_GOOD")"
-BAD_DIGEST="$(digest_of "$LAB_TAG_BAD")"
+GOOD_DIGEST="$(digest_of "$LAB_REPO" "$LAB_TAG_GOOD")"
+BAD_DIGEST="$(digest_of "$LAB_REPO" "$LAB_TAG_BAD")"
+GOOD_BROWSER_DIGEST="$(digest_of "$LAB_BROWSER_REPO" "$LAB_TAG_GOOD")"
+BAD_BROWSER_DIGEST="$(digest_of "$LAB_BROWSER_REPO" "$LAB_TAG_BAD")"
 info "good digest: $GOOD_DIGEST"
 info "bad  digest: $BAD_DIGEST"
+info "good browser digest: $GOOD_BROWSER_DIGEST"
+info "bad  browser digest: $BAD_BROWSER_DIGEST"
 
 # ==============================================================================
 step "T1 — missing tag is rejected by preflight"
@@ -247,6 +279,43 @@ if play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1; then
     else
         fail "the container is not healthy"
     fi
+    # The browser runtime: the same tag, a second image, a second digest.
+    BROWSER_DIGEST="$(grep '^BROWSER_DIGEST=' "$LAB_BASE/.env" | cut -d= -f2 | tr -d '[:space:]')"
+    if [[ "$BROWSER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        pass ".env carries a browser digest: $BROWSER_DIGEST"
+    else
+        fail ".env does not carry a sha256:<64 hex> browser digest: '$BROWSER_DIGEST'"
+    fi
+    if [[ "$BROWSER_DIGEST" == "$GOOD_BROWSER_DIGEST" ]]; then
+        pass "the browser digest is the one the registry reports for the tag"
+    else
+        fail "the browser digest does not match the registry: '$BROWSER_DIGEST' != '$GOOD_BROWSER_DIGEST'"
+    fi
+    if [[ -f "$LAB_BASE/.deployed-browser-digest" ]]; then
+        BROWSER_DEPLOYED="$(tr -d '[:space:]' < "$LAB_BASE/.deployed-browser-digest")"
+        if [[ "$BROWSER_DEPLOYED" == "$GOOD_BROWSER_DIGEST" ]]; then
+            pass "the browser state file holds the running digest"
+        else
+            fail "the browser state file holds '$BROWSER_DEPLOYED', expected '$GOOD_BROWSER_DIGEST'"
+        fi
+    else
+        fail "the browser state file was not written"
+    fi
+    if [[ -f "$LAB_BASE/browser.env" ]]; then
+        pass "browser.env was rendered"
+    else
+        fail "browser.env was not rendered"
+    fi
+    if grep -q "^ADSPOWER_API_KEY=$LAB_ADMIN_API_KEY$" "$LAB_BASE/browser.env" 2>/dev/null; then
+        pass "browser.env carries the AdsPower key"
+    else
+        fail "browser.env does not carry the AdsPower key"
+    fi
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$LAB_BROWSER_CONTAINER" 2>/dev/null)" == "true" ]]; then
+        pass "the browser runtime container is running"
+    else
+        fail "the browser runtime container is not running"
+    fi
 else
     fail "the deploy failed"
     tail -30 "$OUT"
@@ -257,13 +326,17 @@ rm -f "$OUT"
 step "T5 — a second run changes nothing (idempotent)"
 ENV_BEFORE="$(cat "$LAB_BASE/.env")"
 STATE_BEFORE="$(cat "$LAB_BASE/.deployed-digest")"
+BROWSER_ENV_BEFORE="$(cat "$LAB_BASE/browser.env")"
+BROWSER_STATE_BEFORE="$(cat "$LAB_BASE/.deployed-browser-digest")"
 OUT="$(mktemp)"
 play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1 || true
 if [[ "$ENV_BEFORE" == "$(cat "$LAB_BASE/.env")" \
-   && "$STATE_BEFORE" == "$(cat "$LAB_BASE/.deployed-digest")" ]]; then
-    pass ".env and the state file are unchanged"
+   && "$STATE_BEFORE" == "$(cat "$LAB_BASE/.deployed-digest")" \
+   && "$BROWSER_ENV_BEFORE" == "$(cat "$LAB_BASE/browser.env")" \
+   && "$BROWSER_STATE_BEFORE" == "$(cat "$LAB_BASE/.deployed-browser-digest")" ]]; then
+    pass ".env, browser.env and the state files are unchanged"
 else
-    fail "a second run rewrote .env or the state file"
+    fail "a second run rewrote .env, browser.env or a state file"
 fi
 if grep -qE 'failed=0' "$OUT"; then
     pass "the second run did not fail"
@@ -332,6 +405,25 @@ else
     else
         fail "the previous image is not running"
     fi
+    # The browser runtime rolls back with it: the browser image changed with
+    # the tag, so the previous browser digest is what has to be running again.
+    BROWSER_DIGEST="$(grep '^BROWSER_DIGEST=' "$LAB_BASE/.env" | cut -d= -f2 | tr -d '[:space:]')"
+    if [[ "$BROWSER_DIGEST" == "$GOOD_BROWSER_DIGEST" ]]; then
+        pass ".env was re-rendered with the previous browser digest"
+    else
+        fail ".env holds the browser digest '$BROWSER_DIGEST', expected '$GOOD_BROWSER_DIGEST'"
+    fi
+    BROWSER_DEPLOYED="$(tr -d '[:space:]' < "$LAB_BASE/.deployed-browser-digest" 2>/dev/null || true)"
+    if [[ "$BROWSER_DEPLOYED" == "$GOOD_BROWSER_DIGEST" ]]; then
+        pass "the browser state file still holds the previous digest"
+    else
+        fail "the browser state file holds '$BROWSER_DEPLOYED', expected '$GOOD_BROWSER_DIGEST'"
+    fi
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$LAB_BROWSER_CONTAINER" 2>/dev/null)" == "true" ]]; then
+        pass "the browser runtime is running again"
+    else
+        fail "the browser runtime is not running"
+    fi
 fi
 rm -f "$OUT"
 
@@ -358,6 +450,12 @@ else
         pass "the state file still holds the previous digest"
     else
         fail "the state file holds '$DEPLOYED', expected '$GOOD_DIGEST'"
+    fi
+    BROWSER_DIGEST="$(grep '^BROWSER_DIGEST=' "$LAB_BASE/.env" | cut -d= -f2 | tr -d '[:space:]')"
+    if [[ "$BROWSER_DIGEST" == "$GOOD_BROWSER_DIGEST" ]]; then
+        pass ".env still holds the previous browser digest"
+    else
+        fail ".env holds the browser digest '$BROWSER_DIGEST', expected '$GOOD_BROWSER_DIGEST'"
     fi
 fi
 rm -f "$OUT"

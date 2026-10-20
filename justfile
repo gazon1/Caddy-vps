@@ -78,14 +78,25 @@ cert-check *args:
 # Gradle dependencies. `just deploy` in the application repository builds the
 # image, pushes it, and calls this with the tag.
 #
+# TWO images are deployed, both by digest, from the same tag: the crawler
+# (ghcr.io/gazon1/wb-parser) and the AdsPower browser runtime it drives
+# (ghcr.io/gazon1/wb-parser-adspower). The browser runtime is a container
+# beside the crawler, sharing its network namespace, so the AdsPower Local API
+# is reachable at 127.0.0.1:50325 inside it and nothing is published on the
+# host.
+#
 # Required in the environment:
 #   WBPARSER_DB_PASSWORD       postgres password for the crawler database
 #   WBPARSER_ADMIN_PASSWORD    password for the admin API; the app ships an empty
 #                              default, and an empty one leaves /api/admin/**
 #                              reachable with a credential nobody chose
+#   WBPARSER_ADMIN_API_KEY     the AdsPower Local API key: the browser runtime
+#                              starts the API with it and the crawler
+#                              authenticates against it with it. The role
+#                              refuses to deploy without it.
 # Optional:
-#   WBPARSER_ADMIN_API_KEY     the X-Api-Key for admin endpoints (also used for
-#                              adsbrowser: the AdsPower Local API key)
+#   WBPARSER_GHCR_USER         registry user, if the package is private
+#   WBPARSER_GHCR_TOKEN        registry token, if the package is private
 #   WBPARSER_COMPOSE_SRC       path to deploy/docker-compose.vps.yml in the app
 #                              checkout; `just deploy` passes this directly
 #
