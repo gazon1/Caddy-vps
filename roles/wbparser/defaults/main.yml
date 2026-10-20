@@ -151,7 +151,12 @@ wbparser_route_url: "https://{{ wbparser_hostname }}/api/health/live"
 # running, and the browser starts a virtual display and the AdsPower Local API
 # before it is of any use. Too short a timeout fails a deploy that was about to
 # succeed, and a rollback is the wrong answer to "not yet".
-wbparser_health_timeout: 180
+# 600, not 180: the first start of the browser runtime downloads the Chrome kernel
+# (520 MB) before its Local API answers, and the compose wait covers both
+# services. After that the kernel is in the volume and the browser is healthy in
+# seconds. A timeout shorter than the first download would fail a deploy that was
+# about to succeed.
+wbparser_health_timeout: 600
 wbparser_health_retries: 20
 wbparser_health_delay: 6
 
