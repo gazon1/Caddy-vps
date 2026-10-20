@@ -12,9 +12,10 @@ adsbrowser_tarball_sha256: "f19a451fa5bea9f8a2f4f3e2c60d42978db54cde9ba602f7ce6c
 
 # --- AdsPower Local API -------------------------------------------------------
 # The endpoint where the AdsPower Local API is reachable.
-# On the VPS this is typically the kotlin-try adspower container:
-#   http://host.docker.internal:50325  (if running in docker on the VPS)
-#   http://localhost:50325             (if running as a native service)
+# The browser runtime image (wb-parser-browser) serves the API inside the
+# crawler's network namespace, so the crawler reaches it at 127.0.0.1:50325.
+# On the host itself the API is the one the adsbrowser_api role runs natively:
+#   http://localhost:50325             (native systemd service)
 adsbrowser_endpoint: "http://localhost:50325"
 adsbrowser_api_port: "50325"
 

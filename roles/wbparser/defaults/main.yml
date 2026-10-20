@@ -23,19 +23,52 @@ wbparser_image_ref: "{{ wbparser_registry }}/{{ wbparser_image_owner }}/{{ wbpar
 # image would otherwise ship whatever the registry considers newest.
 wbparser_tag: ""
 
+# --- Browser runtime ---------------------------------------------------------
+# The AdsPower runtime the crawler drives: a headless Chrome behind the AdsPower
+# Local API. It ships as a SECOND image from the same application repository,
+# because the host has no outbound network and could not install the runtime
+# there by downloading anything.
+#
+# The two images are built from the same commit and published under the same
+# tag, so the operator still passes exactly one tag. It can be overridden, but
+# there is no reason to: a browser runtime from another commit is a different
+# thing than the crawler that drives it.
+wbparser_browser_image_name: "wb-parser-adspower"
+
+# The browser image reference, assembled from the same registry and owner as
+# the crawler's, so the two are pulled from one place with one login.
+wbparser_browser_image_ref: >-
+  {{ wbparser_registry }}/{{ wbparser_image_owner }}/{{ wbparser_browser_image_name }}
+
+# The tag the browser image is resolved from. Defaults to the crawler's tag.
+wbparser_browser_tag: "{{ wbparser_tag }}"
+
 # --- Where it lives on the host ----------------------------------------------
 wbparser_base: "/opt/wbparser"
 wbparser_compose_file: "{{ wbparser_base }}/docker-compose.vps.yml"
 
-# Two env files, on purpose — see deploy/docker-compose.vps.yml:
-#   .env     the image digest, which compose interpolates (so `$` in it expands)
-#   app.env  the credentials, passed through env_file (so `$` in them does not)
+# Three env files, on purpose — see deploy/docker-compose.vps.yml:
+#   .env         the image digests, which compose interpolates (so `$` in it expands)
+#   app.env      the crawler's credentials, passed through env_file (so `$` in
+#                them does not)
+#   browser.env  the browser runtime's key, also passed through env_file
 wbparser_env_file: "{{ wbparser_base }}/.env"
 wbparser_app_env_file: "{{ wbparser_base }}/app.env"
+
+# The browser runtime's secret, in a file of its own. The browser service gets
+# it through `env_file`, which passes values literally — the AdsPower key is a
+# credential and must not sit in a file compose interpolates.
+wbparser_browser_env_file: "{{ wbparser_base }}/browser.env"
 
 # The digest currently running, written on success. Read at the start of every
 # deploy so a failed one has something to roll back to.
 wbparser_state_file: "{{ wbparser_base }}/.deployed-digest"
+
+# The same thing for the browser runtime, in a file of its own. Two files, not
+# one with two lines: each image rolls back to its own previous digest, and a
+# file that is written line by line can end up half-updated if a deploy dies
+# between the two writes.
+wbparser_browser_state_file: "{{ wbparser_base }}/.deployed-browser-digest"
 
 # The state file of the previous format. It held a TAG, and a tag can be moved
 # under you, so it is read exactly once — on the first deploy after the switch
@@ -51,21 +84,38 @@ wbparser_compose_src: ""
 # --- Container ---------------------------------------------------------------
 wbparser_container_name: "wb-parser"
 
+# The browser runtime's container. It runs with `network_mode:
+# "service:wb-parser"`, so it shares the crawler's network namespace: the
+# AdsPower Local API at 127.0.0.1:50325 and the Chrome CDP ports are reachable
+# by the crawler over loopback, and nothing is published on the host.
+wbparser_browser_container_name: "wb-parser-browser"
+
+# The name of the browser service in the compose file. The compose file is
+# owned by the application repository; this is what it calls the service.
+wbparser_browser_service_name: "wb-parser-browser"
+
 # --- Application -------------------------------------------------------------
 # `worker` turns on the cron scheduler. `admin` and `public` leave it off.
 wbparser_profile: "worker"
 
-# Flyway is OFF here on purpose, and that is a debt, not a preference.
+# Flyway is ON: the production database has been migrated by the application
+# itself, and its Flyway history now matches the migrations in the application
+# repository. The debt this flag used to carry — a database whose history the
+# build did not recognise, which made Flyway abort every startup with a
+# checksum mismatch — is gone, and the schema has one owner again.
 #
-# The database this crawler reads has migration history this build does not
-# recognise: Flyway aborts startup with a checksum mismatch, so enabling it
-# would fail every deploy at the health gate. The proper resolution is an
-# explicit `flyway baseline` + `flyway migrate` against that database, one time,
-# by hand — after which this goes back to true and the schema has one owner.
+# What this changes for the operator: a migration added to the application
+# repository is now applied BY DEPLOYING. If a future migration cannot be
+# applied that way — a migration that needs data the crawler is still writing,
+# or one that has to be applied before the new code starts — apply it
+# explicitly, one time, by hand:
 #
-# Until then the schema is whatever it already is, and a migration added to this
-# repository will NOT be applied by deploying.
-wbparser_flyway_enabled: "false"
+#   flyway -url=jdbc:postgresql://<db>:5432/<db> -locations=filesystem:... migrate
+#
+# and only then deploy. Do not turn this flag off to avoid a migration: the
+# schema and the code would drift apart again, and the next deploy would fail
+# on the very checksum mismatch this flag was switched on to end.
+wbparser_flyway_enabled: "true"
 
 # Credentials for pulling a private image from the registry. Leave empty when the
 # package is public or the host is already logged in; the role skips the login
@@ -95,9 +145,22 @@ wbparser_route_url: "https://{{ wbparser_hostname }}/api/health/live"
 # --- Health gate --------------------------------------------------------------
 # A restart is not a deploy: the container has to report healthy, and if it does
 # not, the previous digest is put back before this task fails.
-wbparser_health_timeout: 120
+#
+# The timeout covers BOTH services now, because compose waits for all of them:
+# the crawler has to come up healthy and the browser runtime has to come up
+# running, and the browser starts a virtual display and the AdsPower Local API
+# before it is of any use. Too short a timeout fails a deploy that was about to
+# succeed, and a rollback is the wrong answer to "not yet".
+wbparser_health_timeout: 180
 wbparser_health_retries: 20
 wbparser_health_delay: 6
+
+# The browser runtime is gated the same way, but more loosely: the container
+# only has to be RUNNING, not healthy. Its own healthcheck (if the compose
+# file declares one) covers the AdsPower Local API; the crawler's preflight
+# covers the runtime from the inside, where it actually matters.
+wbparser_browser_health_retries: 10
+wbparser_browser_health_delay: 3
 
 # --- Ownership ---------------------------------------------------------------
 # /opt is root-owned; these run without become unless the playbook asks for it.

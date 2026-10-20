@@ -12,6 +12,14 @@
 # digest is what ends up in .env, in the state file, and in every message that
 # says what is running.
 #
+# TWO images are deployed, both by digest:
+#
+#   wb-parser          the crawler itself
+#   wb-parser-browser  the AdsPower runtime (headless Chrome + Local API) the
+#                      crawler drives. It comes from the same application
+#                      repository and is published under the same tag, so the
+#                      operator still passes exactly one tag.
+#
 # What this role does NOT do, on purpose:
 #
 #   - it does not clone the repository or build anything. The host has no
@@ -43,6 +51,26 @@
     wbparser_registry_token: "{{ lookup('env', 'WBPARSER_GHCR_TOKEN') | default(wbparser_registry_token, true) }}"
   no_log: true
 
+# The AdsPower Local API key, from the same source the adsbrowser roles use:
+# the `adsbrowser_api_key` variable the playbook resolves from -e, from
+# WBPARSER_ADMIN_API_KEY, or from the vault — and, when this role runs on its
+# own, from the environment. The browser runtime starts the Local API with it
+# and the crawler authenticates against it with it, so the two must be given
+# the same key; one key, one place it is written down.
+- name: Resolve the AdsPower Local API key
+  ansible.builtin.set_fact:
+    # The comparison is parenthesised on purpose: in Jinja `a | length > 0 |
+    # ternary(x, y)` parses as `(a|length) > (0|ternary(x, y))`, so the filter
+    # binds tighter than the comparison and the condition ends up comparing an
+    # int with a string.
+    _wbparser_adsbrowser_api_key: >-
+      {{
+        ((adsbrowser_api_key | default('', true)) | length > 0)
+        | ternary(adsbrowser_api_key | default('', true),
+                  lookup('env', 'WBPARSER_ADMIN_API_KEY'))
+      }}
+  no_log: true
+
 - name: Refuse to deploy without a tag
   ansible.builtin.assert:
     that:
@@ -71,6 +99,21 @@
       ships an empty default for it, and an empty ADMIN_PASSWORD would leave the
       admin API reachable with a credential nobody chose.
       WBPARSER_ADMIN_PASSWORD='…' just wbparser-deploy
+
+# The browser runtime is a separate image, and a crawler without a browser
+# cannot fetch a single page. A missing key is caught here, not by a crawler
+# that starts and then fails every fetch.
+- name: Refuse to deploy without the AdsPower Local API key
+  ansible.builtin.assert:
+    that:
+      - _wbparser_adsbrowser_api_key | length > 0
+    fail_msg: >-
+      The AdsPower Local API key is not set. The browser runtime starts the
+      Local API with it and the crawler authenticates against it with it, so
+      the deploy cannot leave it out. Provide it the way the adsbrowser roles
+      take it:
+        just wbparser-deploy -e wbparser_tag=<sha> -e adsbrowser_api_key=<key>
+        WBPARSER_ADMIN_API_KEY=<key> just wbparser-deploy
 
 # The compose file comes from the application repository. Checked with a lookup
 # rather than a delegated stat: delegate_to inherits the host's become, and
@@ -149,6 +192,23 @@
   ansible.builtin.set_fact:
     wbparser_digest: "{{ wbparser_resolved_digest }}"
 
+# The browser runtime, resolved the same way through the same include: a tag
+# is a name, and the browser the crawler drives must be the browser the
+# deployment was checked against. Both images come from the same repository
+# and are published under the same tag, so one tag resolves two digests.
+- name: Resolve the browser runtime tag to a digest
+  ansible.builtin.include_tasks: resolve-digest.yml
+  vars:
+    wbparser_resolve_ref: "{{ wbparser_browser_image_ref }}:{{ wbparser_browser_tag }}"
+    wbparser_resolve_note: >-
+      The browser runtime image is built from the same commit as the crawler
+      and is published under the same tag, so the tag
+      {{ wbparser_browser_tag }} names it.
+
+- name: Keep the digest of the browser runtime image
+  ansible.builtin.set_fact:
+    wbparser_browser_digest: "{{ wbparser_resolved_digest }}"
+
 # ── Remember what is running now ──────────────────────────────────────────────
 # Read BEFORE .env is rewritten, because that file is what the rollback uses.
 
@@ -164,6 +224,22 @@
     wbparser_previous_digest: >-
       {{ _wbparser_state.content | b64decode | trim
          if _wbparser_state.content is defined else '' }}
+
+# The browser runtime has its own state, because it has its own previous
+# version: a deploy can change the crawler, the browser, or both, and each
+# rolls back to what was running before it.
+- name: Read the currently deployed browser digest
+  ansible.builtin.slurp:
+    src: "{{ wbparser_browser_state_file }}"
+  register: _wbparser_browser_state
+  changed_when: false
+  failed_when: false
+
+- name: Work out the previous browser digest
+  ansible.builtin.set_fact:
+    wbparser_previous_browser_digest: >-
+      {{ _wbparser_browser_state.content | b64decode | trim
+         if _wbparser_browser_state.content is defined else '' }}
 
 # The first deploy after the switch to digest deployment finds a state file
 # from the old format: a TAG, which a moved tag makes ambiguous. It is
@@ -230,6 +306,19 @@
     mode: "0644"
   vars:
     wbparser_env_digest: "{{ wbparser_digest }}"
+    wbparser_env_browser_digest: "{{ wbparser_browser_digest }}"
+
+# The AdsPower key. It goes into a file of its own because the browser service
+# reads it through `env_file`, which passes values literally — a key with a `$`
+# in it must not be expanded by the tooling that reads the file.
+- name: Render the browser runtime environment file
+  ansible.builtin.template:
+    src: wbparser.browser.env.j2
+    dest: "{{ wbparser_browser_env_file }}"
+    owner: "{{ wbparser_owner }}"
+    group: "{{ wbparser_group }}"
+    mode: "0600"  # holds the AdsPower Local API key
+  no_log: true
 
 - name: Render the application environment file
   ansible.builtin.template:
@@ -238,12 +327,19 @@
     owner: "{{ wbparser_owner }}"
     group: "{{ wbparser_group }}"
     mode: "0600"  # holds the database password and the admin credentials
+  # The diff of this template is the file's content: the database password,
+  # the admin password and the AdsPower key, in clear text, in the log.
+  no_log: true
 
 # ── Deploy, and put it back if it does not come up ───────────────────────────
 
-- name: Pull the image and start the container
+- name: Pull the images and start the containers
   block:
 
+    # One compose call starts both services. The compose file belongs to the
+    # application repository and declares both of them; `pull: always` pulls
+    # every image it names, so the crawler AND the browser runtime arrive by
+    # digest in the same step.
     - name: Pull and start
       community.docker.docker_compose_v2:
         project_src: "{{ wbparser_base }}"
@@ -272,10 +368,37 @@
       retries: "{{ wbparser_health_retries }}"
       delay: "{{ wbparser_health_delay }}"
 
+    # The browser runtime has to be RUNNING, not healthy: a crawler that comes
+    # up healthy with no browser beside it is a crawler that fails every fetch
+    # for a reason that has nothing to do with its own healthcheck. The
+    # container shares the crawler's network namespace, so the AdsPower Local
+    # API at 127.0.0.1:50325 and the Chrome CDP ports are reachable by the
+    # crawler without anything being published on the host.
+    - name: Confirm the browser runtime container is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ '{{.State.Running}}' }}"
+          - "{{ wbparser_browser_container_name }}"
+      register: _wbparser_browser_inspect
+      changed_when: false
+      until: _wbparser_browser_inspect.stdout | trim == 'true'
+      retries: "{{ wbparser_browser_health_retries }}"
+      delay: "{{ wbparser_browser_health_delay }}"
+
     - name: Record the digest that is now running
       ansible.builtin.copy:
         content: "{{ wbparser_digest }}\n"
         dest: "{{ wbparser_state_file }}"
+        owner: "{{ wbparser_owner }}"
+        group: "{{ wbparser_group }}"
+        mode: "0644"
+
+    - name: Record the browser runtime digest that is now running
+      ansible.builtin.copy:
+        content: "{{ wbparser_browser_digest }}\n"
+        dest: "{{ wbparser_browser_state_file }}"
         owner: "{{ wbparser_owner }}"
         group: "{{ wbparser_group }}"
         mode: "0644"
@@ -301,22 +424,47 @@
       changed_when: false
       failed_when: false
 
+    # The browser runtime's own last words, when there is one. A crawler that
+    # came up healthy and a browser that did not start is a different failure
+    # from a crawler that never came up, and the browser's log says which.
+    - name: Collect the last log lines from the failed browser runtime
+      ansible.builtin.command:
+        argv: [docker, logs, --tail, "40", "{{ wbparser_browser_container_name }}"]
+      register: _wbparser_browser_failed_logs
+      changed_when: false
+      failed_when: false
+
     # Nothing to go back to on a first deploy. Reported before the rollback
     # steps, which would otherwise re-render an empty digest and start nothing.
     - name: Report that there is nothing to roll back to
       ansible.builtin.fail:
         msg: >-
           {{ wbparser_image_ref }}@{{ wbparser_digest }} (the image named by the
-          tag {{ wbparser_tag }}) did not become healthy within
+          tag {{ wbparser_tag }}) did not come up within
           {{ wbparser_health_timeout }}s, and this is the first deploy on this
           host — there is no previous image to restore. The failed container is
           left in place for inspection.
           {{ '\n\nContainer logs:\n' }}
           {{ (_wbparser_failed_logs.stdout | default('')) }}
           {{ (_wbparser_failed_logs.stderr | default('')) }}
+          {{ '\n\nBrowser runtime logs:\n' }}
+          {{ (_wbparser_browser_failed_logs.stdout | default('')) }}
+          {{ (_wbparser_browser_failed_logs.stderr | default('')) }}
       when: wbparser_previous_digest | length == 0
 
-    - name: Re-render the image digest file with the previous digest
+    # The browser runtime rolls back to its own previous digest. When there is
+    # none — the first deploy that adds the browser to a host that already ran
+    # the crawler — there is nothing to go back to, and the browser stays on
+    # the image this deploy pulled: the crawler that comes back is an older
+    # one that does not use it.
+    - name: Work out the digests to roll back to
+      ansible.builtin.set_fact:
+        wbparser_rollback_digest: "{{ wbparser_previous_digest }}"
+        wbparser_rollback_browser_digest: >-
+          {{ (wbparser_previous_browser_digest | length > 0)
+             | ternary(wbparser_previous_browser_digest, wbparser_browser_digest) }}
+
+    - name: Re-render the image digest file with the previous digests
       ansible.builtin.template:
         src: wbparser.env.j2
         dest: "{{ wbparser_env_file }}"
@@ -324,12 +472,13 @@
         group: "{{ wbparser_group }}"
         mode: "0644"
       vars:
-        wbparser_env_digest: "{{ wbparser_previous_digest }}"
+        wbparser_env_digest: "{{ wbparser_rollback_digest }}"
+        wbparser_env_browser_digest: "{{ wbparser_rollback_browser_digest }}"
 
     # After the .env above, never before: compose reads the digest out of that
     # file, so starting the container first would re-run the image that just
     # failed.
-    - name: Restore the previous digest
+    - name: Restore the previous digests
       community.docker.docker_compose_v2:
         project_src: "{{ wbparser_base }}"
         files:
@@ -339,19 +488,32 @@
         wait: true
         wait_timeout: "{{ wbparser_health_timeout }}"
       vars:
-        wbparser_env_digest: "{{ wbparser_previous_digest }}"
+        wbparser_env_digest: "{{ wbparser_rollback_digest }}"
+        wbparser_env_browser_digest: "{{ wbparser_rollback_browser_digest }}"
 
     - name: Fail with what happened and what was done about it
       ansible.builtin.fail:
         msg: >-
           {{ wbparser_image_ref }}@{{ wbparser_digest }} (the image named by the
-          tag {{ wbparser_tag }}) did not become healthy within
+          tag {{ wbparser_tag }}) did not come up within
           {{ wbparser_health_timeout }}s. Rolled back to
-          {{ wbparser_image_ref }}@{{ wbparser_previous_digest }}, which is what
+          {{ wbparser_image_ref }}@{{ wbparser_rollback_digest }}, which is what
           is running now.
+          {% if wbparser_previous_browser_digest | length > 0 %}
+          The browser runtime was rolled back too, to
+          {{ wbparser_browser_image_ref }}@{{ wbparser_rollback_browser_digest }}.
+          {% else %}
+          The browser runtime stays on
+          {{ wbparser_browser_image_ref }}@{{ wbparser_browser_digest }}: there was
+          no browser runtime running before this deploy, so there is nothing to
+          roll it back to.
+          {% endif %}
           {{ '\n\nContainer logs:\n' }}
           {{ (_wbparser_failed_logs.stdout | default('')) }}
           {{ (_wbparser_failed_logs.stderr | default('')) }}
+          {{ '\n\nBrowser runtime logs:\n' }}
+          {{ (_wbparser_browser_failed_logs.stdout | default('')) }}
+          {{ (_wbparser_browser_failed_logs.stderr | default('')) }}
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
@@ -361,7 +523,14 @@
       - "Requested tag: {{ wbparser_tag }}"
       - "Running image: {{ wbparser_image_ref }}@{{ wbparser_digest }}"
       - "Digest: {{ wbparser_digest }}"
+      - "Browser runtime: {{ wbparser_browser_image_ref }}@{{ wbparser_browser_digest }}"
+      - "Browser service: {{ wbparser_browser_service_name }} ({{ wbparser_browser_container_name }})"
       - "Database: {{ wbparser_db_host }}:{{ wbparser_db_port }}/{{ wbparser_db_name }}"
       - "Profile: {{ wbparser_profile }}"
+      - "Flyway: {{ wbparser_flyway_enabled }}"
       - "Caddy route: {{ wbparser_hostname }} → {{ wbparser_upstream }}"
       - "Rollback target: {{ wbparser_image_ref }}@{{ wbparser_previous_digest | default(wbparser_digest) }}"
+      - >-
+        Browser rollback target:
+        {{ wbparser_browser_image_ref }}@{{ (wbparser_previous_browser_digest | length > 0)
+        | ternary(wbparser_previous_browser_digest, wbparser_browser_digest) }}

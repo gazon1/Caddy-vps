@@ -8,14 +8,16 @@
 #   4. Installs the adspower-browser npm package from a pre-packaged tarball
 #      (the VPS has no outbound network, so npm install from registry is impossible)
 #   5. Registers Xvfb as a systemd service (enabled, not just started via shell)
-#   6. Pre-checks that the kotlin-try adspower container is reachable
+#   6. Reports whether the foreign 'adspower' container is running (not a gate)
 #   7. Checks connectivity to the AdsPower Local API
 #   8. Verifies a headless browser launch (optional — requires a test profile ID)
 #
 # Prerequisites:
 #   - The AdsPower Local API must already be running at
 #     adsbrowser_endpoint (default http://localhost:50325).
-#     The kotlin-try docker.adspower container satisfies this when co-located.
+#     The browser runtime image (wb-parser-browser) serves it inside the
+#     crawler's network namespace; the adsbrowser_api role serves a native one
+#     on the host. Either way, the check below is what decides.
 #   - adsbrowser_api_key must be provided via -e or resolved from WBPARSER_ADMIN_API_KEY.
 #
 # Usage (standalone):
@@ -252,9 +254,18 @@
     mode: "0644"
   become: true
 
-# ── Pre-check: kotlin-try adspower container must be running (fix #6) ────────────
+# ── The foreign adspower container (a report, not a gate) ─────────────────────
+# This container belongs to ANOTHER project on this host. It used to be the way
+# the AdsPower Local API was reached, and this check used to fail the deploy
+# when it was not running. It is not running any more, and it is not the
+# deploy's business: the browser runtime now ships as an image
+# (wb-parser-browser) and is started by the wbparser role, with the Local API
+# on 127.0.0.1:50325 inside the crawler's network namespace.
+#
+# So this only says what it sees. The check that actually matters is the one
+# below: the AdsPower Local API must answer.
 
-- name: Check if kotlin-try adspower container is running
+- name: Check if the foreign adspower container is running
   ansible.builtin.command:
     argv:
       - docker
@@ -265,15 +276,13 @@
   changed_when: false
   failed_when: false
 
-- name: Fail when kotlin-try adspower container is not running
-  ansible.builtin.fail:
+- name: Report that the foreign adspower container is not there
+  ansible.builtin.debug:
     msg: >-
-      The 'adspower' container is not running on this VPS.
-      Adsbrowser needs the AdsPower Local API to verify headless operation.
-      Start it with:
-        cd /opt/kotlin-try && docker compose -f docker-compose.prod.yml up -d adspower
-      Or, if kotlin-try is not on this VPS, ensure the AdsPower Local API
-      is reachable at {{ adsbrowser_endpoint }}.
+      The 'adspower' container (another project's, not this deployment's) is
+      not running here. Nothing to do about it: the AdsPower runtime this
+      deployment uses is the wb-parser-browser image, and the Local API is
+      checked below.
   when: _adspower_container_check.rc != 0 or _adspower_container_check.stdout | trim != 'running'
 
 # ── AdsPower Local API connectivity check (fix #5 — hard failure) ────────────────
@@ -298,8 +307,10 @@
       Output: {{ _adsbrowser_api_check.stdout | default('') | trim }}
       Stderr: {{ _adsbrowser_api_check.stderr | default('') | trim }}
 
-      Ensure the kotlin-try adspower container is running:
-        cd /opt/kotlin-try && docker compose -f docker-compose.prod.yml up -d adspower
+      The AdsPower runtime that serves this API is the wb-parser-browser
+      image, deployed by the wbparser role. Deploy it, and check that the
+      service is up:
+        docker ps --filter name=wb-parser-browser
   when: _adsbrowser_api_check.rc != 0
 
 # ── Headless browser launch verification ──────────────────────────────────────
