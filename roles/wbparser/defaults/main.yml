@@ -12,8 +12,15 @@ wbparser_registry: "ghcr.io"
 wbparser_image_owner: "gazon1"
 wbparser_image_name: "wb-parser"
 
-# REQUIRED. There is deliberately no `latest` fallback: a deploy that forgot to
-# set it would otherwise ship whatever the registry considers newest.
+# The image reference without the tag, assembled here so the role and the
+# operator are looking at one string.
+wbparser_image_ref: "{{ wbparser_registry }}/{{ wbparser_image_owner }}/{{ wbparser_image_name }}"
+
+# REQUIRED. This is a NAME for an image, not the thing that gets deployed: the
+# role resolves it to a digest and runs THAT, because a tag can be moved and
+# the storefront that reads the catalog API pins the crawler by digest.
+# There is deliberately no `latest` fallback: a deploy that forgot to name an
+# image would otherwise ship whatever the registry considers newest.
 wbparser_tag: ""
 
 # --- Where it lives on the host ----------------------------------------------
@@ -21,14 +28,20 @@ wbparser_base: "/opt/wbparser"
 wbparser_compose_file: "{{ wbparser_base }}/docker-compose.vps.yml"
 
 # Two env files, on purpose — see deploy/docker-compose.vps.yml:
-#   .env     the image tag, which compose interpolates (so `$` in it expands)
+#   .env     the image digest, which compose interpolates (so `$` in it expands)
 #   app.env  the credentials, passed through env_file (so `$` in them does not)
 wbparser_env_file: "{{ wbparser_base }}/.env"
 wbparser_app_env_file: "{{ wbparser_base }}/app.env"
 
-# The tag currently running, written on success. Read at the start of every
+# The digest currently running, written on success. Read at the start of every
 # deploy so a failed one has something to roll back to.
-wbparser_state_file: "{{ wbparser_base }}/.deployed-tag"
+wbparser_state_file: "{{ wbparser_base }}/.deployed-digest"
+
+# The state file of the previous format. It held a TAG, and a tag can be moved
+# under you, so it is read exactly once — on the first deploy after the switch
+# to digest deployment — and resolved to a digest like any other tag. After
+# that the digest file is the only state, and this file is removed.
+wbparser_legacy_state_file: "{{ wbparser_base }}/.deployed-tag"
 
 # The compose file is owned by the application repository — how the crawler runs
 # is the crawler's contract, and changes to it belong in review there. Point this
@@ -81,7 +94,7 @@ wbparser_route_url: "https://{{ wbparser_hostname }}/api/health/live"
 
 # --- Health gate --------------------------------------------------------------
 # A restart is not a deploy: the container has to report healthy, and if it does
-# not, the previous tag is put back before this task fails.
+# not, the previous digest is put back before this task fails.
 wbparser_health_timeout: 120
 wbparser_health_retries: 20
 wbparser_health_delay: 6

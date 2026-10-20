@@ -5,19 +5,28 @@
 #   just deploy                # in the app repo: gates, build, push, then this
 #   just wbparser-deploy -e wbparser_tag=<sha>
 #
+# The tag the operator passes is only a NAME for an image. A tag can be moved;
+# a digest names one set of bytes. The storefront that reads this crawler's
+# catalog API pins the crawler by digest and is verified against exactly those
+# bytes, so this role resolves the tag to a digest first and deploys THAT. The
+# digest is what ends up in .env, in the state file, and in every message that
+# says what is running.
+#
 # What this role does NOT do, on purpose:
 #
 #   - it does not clone the repository or build anything. The host has no
 #     outbound network, so `git clone` and `./gradlew` both hang until they time
-#     out. The artifact arrives as an image pulled by tag.
+#     out. The artifact arrives as an image pulled by digest.
 #   - it does not manage Caddy. The route is handed to roles/caddy/tasks/routes.yml
 #     by playbooks/wbparser.yml, which already does backup, validation, rollback
 #     and a reachability probe. A second copy of that logic here would be a
 #     second thing to keep in step.
 #   - it does not report success on a restart alone. The container must reach
-#     healthy, and if it does not, the previous tag is restored before the run
-#     fails. A deploy that restarts a container which dies 70 ms later is
+#     healthy, and if it does not, the previous digest is restored before the
+#     run fails. A deploy that restarts a container which dies 70 ms later is
 #     exactly the failure this gate exists to catch.
+#   - it does not fall back to `latest`, or to the tag itself, when the tag
+#     cannot be resolved. An image that cannot be named is not deployed.
 # ==============================================================================
 
 # ── Preflight ────────────────────────────────────────────────────────────────
@@ -41,8 +50,9 @@
     fail_msg: >-
       wbparser_tag is empty. Pass the tag you pushed:
       ansible-playbook playbooks/wbparser.yml -e wbparser_tag=$(git rev-parse --short HEAD)
-      There is no `latest` fallback on purpose — a deploy that forgot to name a
-      tag would ship whatever the registry considers newest.
+      The tag is only a name — this role resolves it to a digest and deploys
+      that. There is no `latest` fallback on purpose: a deploy that forgot to
+      name an image would ship whatever the registry considers newest.
 
 - name: Refuse to deploy without a database password
   ansible.builtin.assert:
@@ -83,10 +93,13 @@
   when: not (_wbparser_compose_readable | default(false) | bool)
 
 # Cheap, fails instantly, and separates "no DNS" from "the pull is slow" — both
-# of which otherwise look like one multi-minute hang.
+# of which otherwise look like one multi-minute hang. The port is stripped
+# first: the question is whether the HOST resolves, and a registry that
+# carries an explicit port would otherwise be looked up as a host named
+# "host:port", which never resolves.
 - name: Check that the registry is resolvable
   ansible.builtin.command:
-    argv: [getent, hosts, "{{ wbparser_registry }}"]
+    argv: [getent, hosts, "{{ wbparser_registry | regex_replace(':[0-9]+$', '') }}"]
   register: _wbparser_dns
   changed_when: false
   failed_when: _wbparser_dns.rc != 0
@@ -121,21 +134,72 @@
     - wbparser_registry_token | length > 0
   changed_when: true
 
+# ── Name the image ───────────────────────────────────────────────────────────
+# The deploy is by digest from here on. The tag the operator passed is only
+# how the image was named; what runs is the digest it pointed at.
+
+- name: Resolve the requested tag to a digest
+  ansible.builtin.include_tasks: resolve-digest.yml
+  vars:
+    wbparser_resolve_ref: "{{ wbparser_image_ref }}:{{ wbparser_tag }}"
+    wbparser_resolve_note: >-
+      The tag {{ wbparser_tag }} was requested with -e wbparser_tag.
+
+- name: Keep the digest of the requested image
+  ansible.builtin.set_fact:
+    wbparser_digest: "{{ wbparser_resolved_digest }}"
+
 # ── Remember what is running now ──────────────────────────────────────────────
 # Read BEFORE .env is rewritten, because that file is what the rollback uses.
 
-- name: Read the currently deployed tag
+- name: Read the currently deployed digest
   ansible.builtin.slurp:
     src: "{{ wbparser_state_file }}"
   register: _wbparser_state
   changed_when: false
   failed_when: false
 
-- name: Work out the previous tag
+- name: Work out the previous digest
   ansible.builtin.set_fact:
-    wbparser_previous_tag: >-
+    wbparser_previous_digest: >-
       {{ _wbparser_state.content | b64decode | trim
          if _wbparser_state.content is defined else '' }}
+
+# The first deploy after the switch to digest deployment finds a state file
+# from the old format: a TAG, which a moved tag makes ambiguous. It is
+# resolved to a digest like any other tag, so the ability to roll back
+# survives the switch instead of being lost with the file.
+- name: Read the legacy tag left by the previous state format
+  ansible.builtin.slurp:
+    src: "{{ wbparser_legacy_state_file }}"
+  register: _wbparser_legacy_state
+  changed_when: false
+  failed_when: false
+
+- name: Work out the legacy tag
+  ansible.builtin.set_fact:
+    wbparser_legacy_tag: >-
+      {{ _wbparser_legacy_state.content | b64decode | trim
+         if _wbparser_legacy_state.content is defined else '' }}
+
+- name: Resolve the legacy tag to a digest
+  ansible.builtin.include_tasks: resolve-digest.yml
+  vars:
+    wbparser_resolve_ref: "{{ wbparser_image_ref }}:{{ wbparser_legacy_tag }}"
+    wbparser_resolve_note: >-
+      It is the rollback target: the tag left in
+      {{ wbparser_legacy_state_file }} by the previous state format. Remove
+      that file to deploy without a rollback target.
+  when:
+    - wbparser_previous_digest | length == 0
+    - wbparser_legacy_tag | length > 0
+
+- name: Keep the legacy tag's digest as the rollback target
+  ansible.builtin.set_fact:
+    wbparser_previous_digest: "{{ wbparser_resolved_digest }}"
+  when:
+    - wbparser_previous_digest | length == 0
+    - wbparser_legacy_tag | length > 0
 
 # ── Install the contract and its configuration ───────────────────────────────
 
@@ -155,9 +219,9 @@
     group: "{{ wbparser_group }}"
     mode: "0644"
 
-# The tag written into .env is a variable of its own so the rollback can
+# The digest written into .env is a variable of its own so the rollback can
 # re-render the same template with the previous value.
-- name: Render the image tag file
+- name: Render the image digest file
   ansible.builtin.template:
     src: wbparser.env.j2
     dest: "{{ wbparser_env_file }}"
@@ -165,7 +229,7 @@
     group: "{{ wbparser_group }}"
     mode: "0644"
   vars:
-    wbparser_env_tag: "{{ wbparser_tag }}"
+    wbparser_env_digest: "{{ wbparser_digest }}"
 
 - name: Render the application environment file
   ansible.builtin.template:
@@ -185,7 +249,10 @@
         project_src: "{{ wbparser_base }}"
         files:
           - "{{ wbparser_compose_file | basename }}"
-        state: started
+        # `present` is `docker compose up` — the collection has no `started`
+        # state, and a container that is already running the right digest is
+        # left alone.
+        state: present
         pull: always
         wait: true
         wait_timeout: "{{ wbparser_health_timeout }}"
@@ -205,13 +272,22 @@
       retries: "{{ wbparser_health_retries }}"
       delay: "{{ wbparser_health_delay }}"
 
-    - name: Record the tag that is now running
+    - name: Record the digest that is now running
       ansible.builtin.copy:
-        content: "{{ wbparser_tag }}\n"
+        content: "{{ wbparser_digest }}\n"
         dest: "{{ wbparser_state_file }}"
         owner: "{{ wbparser_owner }}"
         group: "{{ wbparser_group }}"
         mode: "0644"
+
+    # The legacy tag file has been folded into the digest file. Leaving it
+    # behind would leave a tag that no longer describes the running image, and
+    # a tag is exactly the thing that can be moved under you.
+    - name: Remove the legacy tag file
+      ansible.builtin.file:
+        path: "{{ wbparser_legacy_state_file }}"
+        state: absent
+      when: wbparser_legacy_tag | default('') | length > 0
 
   rescue:
 
@@ -226,20 +302,21 @@
       failed_when: false
 
     # Nothing to go back to on a first deploy. Reported before the rollback
-    # steps, which would otherwise re-render an empty tag and start nothing.
+    # steps, which would otherwise re-render an empty digest and start nothing.
     - name: Report that there is nothing to roll back to
       ansible.builtin.fail:
         msg: >-
-          {{ wbparser_tag }} did not become healthy within
+          {{ wbparser_image_ref }}@{{ wbparser_digest }} (the image named by the
+          tag {{ wbparser_tag }}) did not become healthy within
           {{ wbparser_health_timeout }}s, and this is the first deploy on this
-          host — there is no previous tag to restore. The failed container is
+          host — there is no previous image to restore. The failed container is
           left in place for inspection.
           {{ '\n\nContainer logs:\n' }}
           {{ (_wbparser_failed_logs.stdout | default('')) }}
           {{ (_wbparser_failed_logs.stderr | default('')) }}
-      when: wbparser_previous_tag | length == 0
+      when: wbparser_previous_digest | length == 0
 
-    - name: Re-render the image tag file with the previous tag
+    - name: Re-render the image digest file with the previous digest
       ansible.builtin.template:
         src: wbparser.env.j2
         dest: "{{ wbparser_env_file }}"
@@ -247,28 +324,31 @@
         group: "{{ wbparser_group }}"
         mode: "0644"
       vars:
-        wbparser_env_tag: "{{ wbparser_previous_tag }}"
+        wbparser_env_digest: "{{ wbparser_previous_digest }}"
 
-    # After the .env above, never before: compose reads the tag out of that file,
-    # so starting the container first would re-run the tag that just failed.
-    - name: Restore the previous tag
+    # After the .env above, never before: compose reads the digest out of that
+    # file, so starting the container first would re-run the image that just
+    # failed.
+    - name: Restore the previous digest
       community.docker.docker_compose_v2:
         project_src: "{{ wbparser_base }}"
         files:
           - "{{ wbparser_compose_file | basename }}"
-        state: started
+        state: present
         pull: always
         wait: true
         wait_timeout: "{{ wbparser_health_timeout }}"
       vars:
-        wbparser_env_tag: "{{ wbparser_previous_tag }}"
+        wbparser_env_digest: "{{ wbparser_previous_digest }}"
 
     - name: Fail with what happened and what was done about it
       ansible.builtin.fail:
         msg: >-
-          {{ wbparser_tag }} did not become healthy within
+          {{ wbparser_image_ref }}@{{ wbparser_digest }} (the image named by the
+          tag {{ wbparser_tag }}) did not become healthy within
           {{ wbparser_health_timeout }}s. Rolled back to
-          {{ wbparser_previous_tag }}, which is what is running now.
+          {{ wbparser_image_ref }}@{{ wbparser_previous_digest }}, which is what
+          is running now.
           {{ '\n\nContainer logs:\n' }}
           {{ (_wbparser_failed_logs.stdout | default('')) }}
           {{ (_wbparser_failed_logs.stderr | default('')) }}
@@ -278,8 +358,10 @@
 - name: Report what is deployed
   ansible.builtin.debug:
     msg:
-      - "Image: {{ wbparser_registry }}/{{ wbparser_image_owner }}/{{ wbparser_image_name }}:{{ wbparser_tag }}"
+      - "Requested tag: {{ wbparser_tag }}"
+      - "Running image: {{ wbparser_image_ref }}@{{ wbparser_digest }}"
+      - "Digest: {{ wbparser_digest }}"
       - "Database: {{ wbparser_db_host }}:{{ wbparser_db_port }}/{{ wbparser_db_name }}"
       - "Profile: {{ wbparser_profile }}"
       - "Caddy route: {{ wbparser_hostname }} → {{ wbparser_upstream }}"
-      - "Rollback target: {{ wbparser_tag }}"
+      - "Rollback target: {{ wbparser_image_ref }}@{{ wbparser_previous_digest | default(wbparser_digest) }}"

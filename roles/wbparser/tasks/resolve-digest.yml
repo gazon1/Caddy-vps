@@ -1,0 +1,63 @@
+---
+# Resolve one image reference to the immutable digest of its manifest.
+#
+# The reference arrives as a TAG, because that is what a human has in hand, and
+# leaves as a DIGEST, because that is what the deploy runs on: a tag can be
+# moved to a different image, a digest names one set of bytes. The storefront
+# that reads this crawler's catalog API pins the image by digest, so the deploy
+# has to name the same bytes it was checked against.
+#
+# `docker buildx imagetools inspect` is used rather than `docker manifest
+# inspect` because it prints the digest of the manifest LIST in one field and
+# never pulls the image: the resolution is a registry query, and the bytes
+# arrive later when compose pulls by digest. `docker manifest inspect` returns
+# the same index, but the digest sits in a per-platform Descriptor and has to
+# be picked out of nested JSON.
+#
+# Included twice: once for the tag the operator asked for, and once for the
+# legacy tag the previous state file format left behind.
+#
+#   wbparser_resolve_ref     the reference to resolve
+#   wbparser_resolve_note    optional extra sentence for the failure message
+
+- name: Ask the registry for the digest behind the reference
+  ansible.builtin.command:
+    argv:
+      - docker
+      - buildx
+      - imagetools
+      - inspect
+      - "{{ wbparser_resolve_ref }}"
+      - --format
+      - "{% raw %}{{.Manifest.Digest}}{% endraw %}"
+  register: _wbparser_resolve
+  changed_when: false
+  failed_when: false
+
+- name: Refuse to deploy an image that cannot be named
+  ansible.builtin.fail:
+    msg: >-
+      {{ wbparser_resolve_ref }} does not resolve to an image digest, and this
+      deploy runs on the digest of that reference. There is no fallback to
+      `latest` and no fallback to the tag itself: an image that cannot be
+      named must not be deployed.
+      {{ wbparser_resolve_note | default('') }}
+      {{ '\n' }}
+      Registry said: {{ (_wbparser_resolve.stderr | default('')) | trim }}
+      {{ (_wbparser_resolve.stdout | default('')) | trim }}
+  when: _wbparser_resolve.rc != 0
+
+- name: Refuse a resolution that is not a digest
+  ansible.builtin.fail:
+    msg: >-
+      The registry answered for {{ wbparser_resolve_ref }} with
+      "{{ _wbparser_resolve.stdout | default('') | trim | truncate(200) }}",
+      which is not a sha256:<64 hex> digest. A deploy that cannot name the
+      exact image must not proceed.
+      {{ wbparser_resolve_note | default('') }}
+  when: _wbparser_resolve.rc == 0
+        and (_wbparser_resolve.stdout | default('') | trim | regex_search('^sha256:[0-9a-f]{64}$') is none)
+
+- name: Remember the resolved digest
+  ansible.builtin.set_fact:
+    wbparser_resolved_digest: "{{ _wbparser_resolve.stdout | trim }}"
