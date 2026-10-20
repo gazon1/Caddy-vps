@@ -43,6 +43,10 @@ LAB_COMPOSE="$LAB_BASE/docker-compose.lab.yml"
 LAB_DB_PASSWORD="labtest123"
 LAB_ADMIN_PASSWORD="lab-admin-secret"
 LAB_ADMIN_API_KEY="lab-api-key-$(date +%s)"
+# The catalog API's key. The application refuses to start without it, so the
+# deploy refuses too — the lab has to carry one, or every play would stop at
+# the preflight.
+LAB_CATALOG_API_KEY="lab-catalog-key-$(date +%s)"
 LAB_TAG_GOOD="good"
 LAB_TAG_BAD="bad"
 LAB_TAG_MISSING="no-such-tag-$$"
@@ -77,6 +81,7 @@ PLAYBOOK="$REPO_ROOT/playbooks/wbparser.yml"
 export WBPARSER_DB_PASSWORD="$LAB_DB_PASSWORD"
 export WBPARSER_ADMIN_PASSWORD="$LAB_ADMIN_PASSWORD"
 export WBPARSER_ADMIN_API_KEY="$LAB_ADMIN_API_KEY"
+export WBPARSER_CATALOG_API_KEY="$LAB_CATALOG_API_KEY"
 
 # Everything the role needs to talk to the throwaway registry instead of
 # GHCR. The image coordinates are the same shape as production.
@@ -235,7 +240,22 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T3 — missing admin password is rejected by preflight"
+step "T3 — missing catalog API key is rejected by preflight"
+OUT="$(mktemp)"
+if ( unset WBPARSER_CATALOG_API_KEY; play -e "wbparser_tag=$LAB_TAG_GOOD" ) > "$OUT" 2>&1; then
+    fail "the playbook succeeded even though the catalog API key is empty"
+else
+    if grep -q 'WBPARSER_CATALOG_API_KEY is not set' "$OUT"; then
+        pass "the playbook rejected an empty catalog API key"
+    else
+        fail "the playbook failed but not because of the empty catalog API key"
+        tail -20 "$OUT"
+    fi
+fi
+rm -f "$OUT"
+
+# ==============================================================================
+step "T4 — missing admin password is rejected by preflight"
 OUT="$(mktemp)"
 if ( unset WBPARSER_ADMIN_PASSWORD; play -e "wbparser_tag=$LAB_TAG_GOOD" ) > "$OUT" 2>&1; then
     fail "the playbook succeeded even though the admin password is empty"
@@ -250,7 +270,7 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T4 — the tag is resolved to a digest, and the digest is what is deployed"
+step "T5 — the tag is resolved to a digest, and the digest is what is deployed"
 OUT="$(mktemp)"
 if play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1; then
     ENV_DIGEST="$(grep '^DIGEST=' "$LAB_BASE/.env" | cut -d= -f2 | tr -d '[:space:]')"
@@ -311,6 +331,11 @@ if play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1; then
     else
         fail "browser.env does not carry the AdsPower key"
     fi
+    if grep -q "^CATALOG_API_KEY=$LAB_CATALOG_API_KEY$" "$LAB_BASE/app.env" 2>/dev/null; then
+        pass "app.env carries the catalog API key"
+    else
+        fail "app.env does not carry the catalog API key"
+    fi
     if [[ "$(docker inspect -f '{{.State.Running}}' "$LAB_BROWSER_CONTAINER" 2>/dev/null)" == "true" ]]; then
         pass "the browser runtime container is running"
     else
@@ -323,7 +348,7 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T5 — a second run changes nothing (idempotent)"
+step "T6 — a second run changes nothing (idempotent)"
 ENV_BEFORE="$(cat "$LAB_BASE/.env")"
 STATE_BEFORE="$(cat "$LAB_BASE/.deployed-digest")"
 BROWSER_ENV_BEFORE="$(cat "$LAB_BASE/browser.env")"
@@ -347,7 +372,7 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T6 — the legacy .deployed-tag is migrated into the digest state file"
+step "T7 — the legacy .deployed-tag is migrated into the digest state file"
 printf '%s\n' "$LAB_TAG_GOOD" > "$LAB_BASE/.deployed-tag"
 rm -f "$LAB_BASE/.deployed-digest"
 OUT="$(mktemp)"
@@ -377,7 +402,7 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T7 — an image that never becomes healthy rolls back to the previous digest"
+step "T8 — an image that never becomes healthy rolls back to the previous digest"
 OUT="$(mktemp)"
 if play -e "wbparser_tag=$LAB_TAG_BAD" > "$OUT" 2>&1; then
     fail "the deploy of an unhealthy image succeeded"
@@ -428,7 +453,7 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T8 — a tag that cannot be resolved fails loudly and changes nothing"
+step "T9 — a tag that cannot be resolved fails loudly and changes nothing"
 OUT="$(mktemp)"
 if play -e "wbparser_tag=$LAB_TAG_MISSING" > "$OUT" 2>&1; then
     fail "the deploy succeeded even though the tag does not resolve"

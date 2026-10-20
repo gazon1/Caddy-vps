@@ -23,6 +23,18 @@
 # The browser runtime image is deployed by the wbparser role, not here: the two
 # images are built from the same commit and published under the same tag, and
 # the role resolves that one tag to two digests and rolls both back together.
+#
+# Secrets come from the environment, never from -e on a command line that ends
+# up in shell history and in the CI log:
+#
+#   WBPARSER_DB_PASSWORD       the database password
+#   WBPARSER_ADMIN_PASSWORD    the admin API's password
+#   WBPARSER_ADMIN_API_KEY     the admin API's X-Api-Key (optional)
+#   WBPARSER_CATALOG_API_KEY   the catalog API's key — required, and a
+#                              comma-separated list so a key can be rotated
+#                              without a gap in service
+#   WBPARSER_GHCR_USER         registry user for a private image (optional)
+#   WBPARSER_GHCR_TOKEN        registry token for a private image (optional)
 
 - name: Deploy adsbrowser API, headless browser and wb-parser crawler
   hosts: vps
@@ -92,6 +104,64 @@
     - name: Apply the route
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../roles/caddy/tasks/routes.yml"
       when: wbparser_hostname | length > 0
+      tags: [caddy_routes]
+
+    # The catalog answers only when the schema answers.
+    #
+    # The route is up and the container reports healthy, and neither of those
+    # says anything about the catalog: the container's health check asks
+    # /api/health/live, which does not touch the database at all, and the route
+    # only proves that a request reaches the application.
+    #
+    # /api/catalog/v1/ready does touch it, through the catalog's own pool, and
+    # answers 503 when the schema is not the one the projection expects. This
+    # is the check that the deploy leaves behind: the storefront pins this
+    # image by digest and reads this catalog, and a deploy that shipped a
+    # catalog which cannot answer is a deploy the storefront cannot use.
+    #
+    # The key goes in a header, and the probe does not log: the command's
+    # arguments carry the secret, and an argument list is exactly what a
+    # verbose Ansible run prints. The answer is reported by the task below,
+    # which has the status code and no secret.
+    - name: Ask the catalog whether it can answer
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - --max-time
+          - "30"
+          - --header
+          - "X-Api-Key: {{ _wbparser_catalog_api_key }}"
+          - "https://{{ wbparser_hostname }}/api/catalog/v1/ready"
+      register: _wbparser_catalog_probe
+      changed_when: false
+      # The failure is reported by the task below, which can say what the
+      # catalog answered. `failed_when: false` keeps the task from stopping
+      # the play before that report exists.
+      failed_when: false
+      retries: 6
+      delay: 10
+      until: _wbparser_catalog_probe.stdout | trim == '200'
+      no_log: true
+      when: wbparser_hostname | length > 0
+      tags: [caddy_routes]
+
+    - name: Report what the catalog answered
+      ansible.builtin.fail:
+        msg: >-
+          The catalog answered {{ _wbparser_catalog_probe.stdout | trim }} for
+          /api/catalog/v1/ready — it should be 200. A 503 means the catalog's
+          own database pool cannot reach the schema the projection expects; a
+          401 means the key this deploy carries is not the one the application
+          accepted; a 000 means the request never arrived.
+      when:
+        - wbparser_hostname | length > 0
+        - _wbparser_catalog_probe.stdout | trim != '200'
       tags: [caddy_routes]
 
     - name: Remove the route

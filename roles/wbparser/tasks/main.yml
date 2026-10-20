@@ -47,6 +47,9 @@
     _wbparser_db_password: "{{ lookup('env', 'WBPARSER_DB_PASSWORD') }}"
     _wbparser_admin_password: "{{ lookup('env', 'WBPARSER_ADMIN_PASSWORD') }}"
     _wbparser_admin_api_key: "{{ lookup('env', 'WBPARSER_ADMIN_API_KEY') }}"
+    # The catalog API's key. A list, comma-separated — the application accepts
+    # every key in it, which is what makes a rotation possible without a gap.
+    _wbparser_catalog_api_key: "{{ lookup('env', 'WBPARSER_CATALOG_API_KEY') }}"
     wbparser_registry_user: "{{ lookup('env', 'WBPARSER_GHCR_USER') | default(wbparser_registry_user, true) }}"
     wbparser_registry_token: "{{ lookup('env', 'WBPARSER_GHCR_TOKEN') | default(wbparser_registry_token, true) }}"
   no_log: true
@@ -99,6 +102,26 @@
       ships an empty default for it, and an empty ADMIN_PASSWORD would leave the
       admin API reachable with a credential nobody chose.
       WBPARSER_ADMIN_PASSWORD='…' just wbparser-deploy
+
+# The catalog API's key.
+#
+# The application requires it and does not start without it: a catalog API
+# reachable without a credential is a catalog API anybody can read, and the
+# requirement is in the code rather than in a convention. A deploy that left
+# the key out would therefore produce a container that never comes up — a
+# failure that looks like a crash, not like a missing configuration.
+#
+# The value is a list, comma-separated: the application accepts every key in
+# it, which is what lets a key be rotated without a gap in service.
+- name: Refuse to deploy without the catalog API key
+  ansible.builtin.assert:
+    that:
+      - _wbparser_catalog_api_key | length > 0
+    fail_msg: >-
+      WBPARSER_CATALOG_API_KEY is not set in the environment. The application
+      requires it and refuses to start without it, so a deploy that left it out
+      would produce a container that never comes up.
+      WBPARSER_CATALOG_API_KEY='<key>[,<previous-key>]' just wbparser-deploy
 
 # The browser runtime is a separate image, and a crawler without a browser
 # cannot fetch a single page. A missing key is caught here, not by a crawler

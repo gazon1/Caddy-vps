@@ -152,6 +152,11 @@ just wbshop-deploy \
 export WBPARSER_DB_PASSWORD="..."       # PostgreSQL password
 export WBPARSER_ADMIN_PASSWORD="..."   # Parser admin password
 export WBPARSER_ADMIN_API_KEY="..."    # Parser API key
+# The catalog API's key. Required: the application refuses to start without
+# it, and the deploy refuses without it too. It is a comma-separated list, so
+# a key can be rotated without a gap in service — the new key is added first,
+# the storefront is switched over, and only then is the old one removed.
+export WBPARSER_CATALOG_API_KEY="..."
 ```
 
 ### Tags
