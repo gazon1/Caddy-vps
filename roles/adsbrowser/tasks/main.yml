@@ -1,3 +1,4 @@
+---
 # ==============================================================================
 # Install and verify the adsbrowser CLI on the VPS.
 #
@@ -30,7 +31,7 @@
 #   1. npm pack adspower-browser@<newver> --pack-destination /tmp/
 #   2. sha256sum /tmp/adspower-browser-<newver>.tgz
 #   3. cp /tmp/adspower-browser-<newver>.tgz roles/adsbrowser/files/
-#   4. Update adsbrowser_cli_version and adsbrowser_tarball_sha256 in defaults/main.yml
+#   4. Update adsbrowser_cli_version and adsbrowseradsbrowser_tarball_sha256 in defaults/main.yml
 # ==============================================================================
 
 - name: Gather facts
@@ -44,7 +45,9 @@
 
 - name: Resolve adsbrowser_api_key (fall back to WBPARSER_ADMIN_API_KEY env var)
   ansible.builtin.set_fact:
-    adsbrowser_api_key: "{{ adsbrowser_api_key | default(lookup('env', 'WBPARSER_ADMIN_API_KEY') | default('', true), true) }}"
+    adsbrowser_api_key: >-
+      {{ adsbrowser_api_key
+         | default(lookup('env', 'WBPARSER_ADMIN_API_KEY') | default('', true), true) }}
   when: not (adsbrowser_api_key | default('') | length > 0)
 
 - name: Fail if adsbrowser_api_key is not provided
@@ -110,7 +113,7 @@
     - name: Verify tarball is present on control node
       ansible.builtin.stat:
         path: "{{ role_path }}/files/adspower-browser-{{ adsbrowser_cli_version }}.tgz"
-      register: _tarball_stat
+      register: adsbrowser_tarball_stat
 
     - name: Fail if tarball is missing
       ansible.builtin.fail:
@@ -119,8 +122,8 @@
           not found. To update the package:
             npm pack adspower-browser@{{ adsbrowser_cli_version }} --pack-destination /tmp/
             cp /tmp/adspower-browser-{{ adsbrowser_cli_version }}.tgz roles/adsbrowser/files/
-          Then update adsbrowser_cli_version and adsbrowser_tarball_sha256 in defaults/main.yml
-      when: not (_tarball_stat.stat.exists | default(false) | bool)
+          Then update adsbrowser_cli_version and adsbrowseradsbrowser_tarball_sha256 in defaults/main.yml
+      when: not (adsbrowser_tarball_stat.stat.exists | default(false) | bool)
 
     - name: Copy tarball to VPS
       ansible.builtin.copy:
@@ -132,19 +135,19 @@
     - name: Verify tarball integrity (sha256)
       ansible.builtin.command:
         argv: [sha256sum, "/tmp/adspower-browser-{{ adsbrowser_cli_version }}.tgz"]
-      register: _tarball_sha256
+      register: adsbrowser_tarball_sha256
       changed_when: false
 
     - name: Fail when tarball sha256 does not match expected value
       ansible.builtin.fail:
         msg: >-
           Tarball sha256 mismatch.
-          Expected: {{ adsbrowser_tarball_sha256 }}
-          Got:      {{ _tarball_sha256.stdout | trim | split | last }}
+          Expected: {{ adsbrowseradsbrowser_tarball_sha256 }}
+          Got:      {{ adsbrowser_tarball_sha256.stdout | trim | split | last }}
           The tarball on the control node is corrupted or has been replaced without
-          updating adsbrowser_tarball_sha256 in defaults/main.yml.
+          updating adsbrowseradsbrowser_tarball_sha256 in defaults/main.yml.
       when: >-
-        (_tarball_sha256.stdout | trim | split | last) != adsbrowser_tarball_sha256
+        (adsbrowser_tarball_sha256.stdout | trim | split | last) != adsbrowseradsbrowser_tarball_sha256
 
     - name: Install adspower-browser from tarball
       ansible.builtin.command:
@@ -272,7 +275,7 @@
       - inspect
       - "--format={{ '{{.State.Status}}' }}"
       - adspower
-  register: _adspower_container_check
+  register: adsbrowser_container_check
   changed_when: false
   failed_when: false
 
@@ -283,7 +286,7 @@
       not running here. Nothing to do about it: the AdsPower runtime this
       deployment uses is the wb-parser-browser image, and the Local API is
       checked below.
-  when: _adspower_container_check.rc != 0 or _adspower_container_check.stdout | trim != 'running'
+  when: adsbrowser_container_check.rc != 0 or adsbrowser_container_check.stdout | trim != 'running'
 
 # ── AdsPower Local API connectivity check (fix #5 — hard failure) ────────────────
 
@@ -396,4 +399,7 @@
       - "Xvfb systemd service : enabled + started (display :99)"
       - "DISPLAY               : :99"
       - "AdsPower API          : {{ adsbrowser_endpoint }}:{{ adsbrowser_api_port }}"
-      - "Headless verification : {{ 'passed' if _adsbrowser_has_test_profile | default(false) | bool else 'skipped (no test profile)' }}"
+      - >-
+        Headless verification :
+        {{ 'passed' if _adsbrowser_has_test_profile | default(false) | bool
+           else 'skipped (no test profile)' }}

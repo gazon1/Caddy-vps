@@ -47,7 +47,10 @@
     - name: Load vault secrets if configured
       ansible.builtin.include_vars:
         file: "{{ playbook_dir }}/../inventory/group_vars/vps/vault.yml"
-      ignore_errors: true
+      # The vault file is optional: it may not exist on a machine that keeps
+      # its secrets elsewhere. `failed_when` says that without hiding the task
+      # from the report.
+      failed_when: false
       tags: [always]
 
   vars_files:
