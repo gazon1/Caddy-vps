@@ -1,3 +1,4 @@
+---
 # ==============================================================================
 # Deploy wbshop (product-catalog) with parser + migrations.
 #
@@ -135,7 +136,9 @@
 
         - name: Parse Flyway info output
           ansible.builtin.set_fact:
-            _flyway_schema_count: "{{ _flyway_info.stdout_lines | select('search', 'Schema [^ ]* table') | list | length }}"
+            _flyway_schema_count: >-
+              {{ _flyway_info.stdout_lines
+                 | select('search', 'Schema [^ ]* table') | list | length }}
 
         - name: Show current Flyway state
           ansible.builtin.debug:
@@ -317,11 +320,20 @@
         group: "{{ wbshop_group }}"
         mode: "0644"
 
+    # The URL is assembled here rather than in the template below: written out
+    # in one line it is longer than a line is allowed to be, and a folded
+    # scalar inside the file's contents would put a newline into the URL.
+    - name: Compose the database URL
+      ansible.builtin.set_fact:
+        wbshop_db_authority: "{{ wbshop_db_user }}:{{ wbshop_db_password }}@{{ wbshop_db_host }}:{{ wbshop_db_port }}"
+        wbshop_database_url: "postgresql://{{ wbshop_db_authority }}/{{ wbshop_db_name }}?sslmode=require"
+      no_log: true
+
     - name: Render app.env with DATABASE_URL
       ansible.builtin.copy:
         dest: "{{ wbshop_app_env_file }}"
         content: |
-          DATABASE_URL=postgresql://{{ wbshop_db_user }}:{{ wbshop_db_password }}@{{ wbshop_db_host }}:{{ wbshop_db_port }}/{{ wbshop_db_name }}?sslmode=require
+          DATABASE_URL={{ wbshop_database_url }}
           NEXT_PUBLIC_SITE_URL={{ wbshop_site_url }}
         owner: "{{ wbshop_owner }}"
         group: "{{ wbshop_group }}"
@@ -347,8 +359,7 @@
           register: _wbshop_inspect
           changed_when: false
           until: >-
-            (((_wbshop_inspect.stdout | from_json | first).State.Health) or {})
-            .get('Status', 'none') == 'healthy'
+            (((_wbshop_inspect.stdout | from_json | first).State.Health) or {}).get('Status', 'none') == 'healthy'
           retries: "{{ wbshop_health_retries }}"
           delay: "{{ wbshop_health_delay }}"
 
