@@ -267,6 +267,9 @@ through as they are: there is no `--` separator to put before them.
   systemd unit, `adsbrowser.env` and the route snippet.
 - **The preflight checks**: a missing tag, password or catalog key still
   fails the run, in a dry run exactly as in a real one.
+- **The route snippet.** It is the one file in that list that a real deploy
+  writes to the proxy's `conf.d/` and then serves: a deploy that reports
+  success leaves a route that answers, not just a diff that shows one.
 
 **What a dry run does not show — and does not do**
 

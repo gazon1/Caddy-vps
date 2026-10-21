@@ -8,14 +8,17 @@
 # What it tests:
 #   T1  — preflight assertions reject a missing tag
 #   T2  — preflight assertions reject a missing DB password
-#   T3  — preflight assertions reject a missing admin password
-#   T4  — a tag is resolved to a digest, and the digest is what .env and the
+#   T3  — preflight assertions reject a missing catalog API key
+#   T4  — preflight assertions reject a missing admin password
+#   T5  — a tag is resolved to a digest, and the digest is what .env and the
 #         state file carry — for the crawler AND for the browser runtime
-#   T5  — a second run changes nothing (idempotent)
-#   T6  — the legacy .deployed-tag is migrated into the digest state file
-#   T7  — an image that does not come up healthy rolls back to the previous
+#   T6  — a second run changes nothing (idempotent)
+#   T7  — the legacy .deployed-tag is migrated into the digest state file
+#   T8  — an image that does not come up healthy rolls back to the previous
 #         digest — for both images
-#   T8  — a tag that cannot be resolved fails loudly and changes nothing
+#   T9  — a tag that cannot be resolved fails loudly and changes nothing
+#   T10 — the route is really applied: the snippet lands in the proxy's conf.d
+#         and the proxy answers through it
 #
 # The images come from a throwaway registry on localhost, not from GHCR: the
 # lab needs two images in the SAME repository, one that becomes healthy and one
@@ -26,7 +29,9 @@
 # Requirements:
 #   • docker   (compose v2 plugin, buildx, and a local registry image)
 #   • ansible  with community.docker collection
-#   • alpine:3 (or the ability to pull it) — the stub images are built on it
+#   • alpine:3 (or the ability to pull it) — the browser stub is built on it
+#   • nginx:alpine — the crawler stub is a real HTTP server
+#   • caddy:2.8-alpine — the proxy T10 applies the route to
 # ==============================================================================
 set -euo pipefail
 
@@ -51,6 +56,19 @@ LAB_TAG_GOOD="good"
 LAB_TAG_BAD="bad"
 LAB_TAG_MISSING="no-such-tag-$$"
 
+# The proxy the route is applied to. The deploy hands the route to the caddy
+# role's routes.yml, so the lab needs a proxy to hand it to — the same role,
+# the same playbook (site.yml), the lab's own base directory, container and
+# network.
+CADDY_LAB_BASE="/tmp/wbparser-lab-caddy"
+CADDY_LAB_CONTAINER="caddy_wbparser_lab"
+LAB_HTTP_PORT=18081
+LAB_HTTPS_PORT=18444
+# The site address of the route. The .localhost domain on purpose: Caddy issues
+# such a name from its own internal CA, so the lab never contacts Let's Encrypt
+# (its rule) and the certificate arrives without a public CA in the way.
+LAB_SITE="wb-parser.localhost"
+
 export PATH="$HOME/.local/bin:$PATH"
 
 FAILURES=0
@@ -68,9 +86,10 @@ fail() {
 info() { printf '\033[0;36m  → %s\033[0m\n' "$1"; }
 
 teardown() {
-    docker rm -f "$LAB_CONTAINER" "$LAB_BROWSER_CONTAINER" "$LAB_REGISTRY_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f "$LAB_CONTAINER" "$LAB_BROWSER_CONTAINER" "$LAB_REGISTRY_CONTAINER" \
+        "$CADDY_LAB_CONTAINER" >/dev/null 2>&1 || true
     docker network rm "$LAB_NETWORK" >/dev/null 2>&1 || true
-    rm -rf "$LAB_BASE" >/dev/null 2>&1 || true
+    rm -rf "$LAB_BASE" "$CADDY_LAB_BASE" >/dev/null 2>&1 || true
 }
 trap teardown EXIT
 
@@ -86,7 +105,6 @@ export WBPARSER_CATALOG_API_KEY="$LAB_CATALOG_API_KEY"
 # Everything the role needs to talk to the throwaway registry instead of
 # GHCR. The image coordinates are the same shape as production.
 LAB_ARGS=(
-    --tags wbparser
     -e "wbparser_registry=$LAB_REGISTRY"
     -e "wbparser_image_owner=lab"
     -e "wbparser_image_name=wb-parser"
@@ -111,7 +129,58 @@ LAB_ARGS=(
 )
 
 play() {
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" "${LAB_ARGS[@]}" "$@"
+    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags wbparser "${LAB_ARGS[@]}" "$@"
+}
+
+# The route is applied by the same playbook, but by a different set of tasks:
+# the ones that hand the route to the caddy role. The catalog probe is skipped
+# — the lab has no catalog to ask (there is no database behind it), and the
+# point of this run is the route itself.
+play_routes() {
+    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" \
+        --tags caddy_routes --skip-tags catalog_probe "${LAB_ARGS[@]}" "$@"
+}
+
+# The proxy the route is applied to. The same caddy role and the same
+# site.yml the production host uses, with the lab's own base directory,
+# container, network and ports. The network is the crawler's: on the VPS the
+# proxy and the crawler share one network, and the snippet's upstream is
+# resolved by name on it.
+CADDY_LAB_VARS=(
+    -e "caddy_base=$CADDY_LAB_BASE"
+    -e "caddy_network=$LAB_NETWORK"
+    -e "caddy_container=$CADDY_LAB_CONTAINER"
+    -e "caddy_http_port=$LAB_HTTP_PORT"
+    -e "caddy_https_port=$LAB_HTTPS_PORT"
+    -e "caddy_acme_email=lab@example.invalid"
+    # The lab runs without sudo, so it cannot claim root ownership.
+    -e "caddy_owner=$(id -un)"
+    -e "caddy_group=$(id -gn)"
+    # ...and without CAP_DAC_OVERRIDE the container could not write there either.
+    -e "caddy_hardened_caps=false"
+)
+
+# A request through the route, the way a browser would make it: the site's own
+# name for SNI and Host, and the self-signed certificate accepted explicitly.
+ask_route() {
+    curl -sk --max-time 10 \
+        --resolve "$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" \
+        "https://$LAB_SITE:$LAB_HTTPS_PORT/api/health/live" \
+        -o /dev/null -w '%{http_code}' 2>/dev/null || true
+}
+
+# The proxy answers a moment after the reload: the certificate for a .localhost
+# name comes from Caddy's own CA, and issuing it takes a moment. The lab waits
+# for the route instead of assuming it.
+wait_for_route() {
+    local deadline=$(( $(date +%s) + ${1:-60} )) code
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        code="$(ask_route)"
+        [ "$code" = "200" ] && return 0
+        sleep 1
+    done
+    info "the route did not answer within the window (last code: ${code:-none})"
+    return 1
 }
 
 # ==============================================================================
@@ -139,6 +208,24 @@ build_stub() {
     docker push -q "$LAB_REGISTRY/$LAB_REPO:$tag" >/dev/null
 }
 
+# `good` is a real HTTP server, not a socket trick: it answers 200 to
+# everything, on the port the healthcheck asks for.
+#
+# It has to be a real one, because the route proxies to it (T10) and Go's HTTP
+# client — the one inside Caddy — refuses a response that arrives before the
+# request has been written. busybox nc answers without reading the request
+# first: wget is happy with it, Caddy is not.
+build_good_stub() {
+    local tag="$1"
+    cat > "$LAB_BASE/img/Dockerfile" <<'DOCKERFILE'
+FROM nginx:alpine
+RUN printf 'server {\n    listen 8080;\n    location / { return 200 "ok"; }\n}\n' \
+        > /etc/nginx/conf.d/default.conf
+DOCKERFILE
+    docker build -q -t "$LAB_REGISTRY/$LAB_REPO:$tag" "$LAB_BASE/img" >/dev/null
+    docker push -q "$LAB_REGISTRY/$LAB_REPO:$tag" >/dev/null
+}
+
 # The browser runtime: a second image, in a second repository, published under
 # the same tag — which is the production contract. The label makes the two
 # tags DIFFERENT images, so the two digests differ, so the rollback of the
@@ -152,10 +239,8 @@ build_browser_stub() {
 }
 
 docker image inspect alpine:3 >/dev/null 2>&1 || docker pull alpine:3 >/dev/null
-# The CMD is JSON in the Dockerfile: `\\r\\n` reaches the shell as `\r\n`, and
-# the shell's printf turns that into the CRLF an HTTP response needs.
-build_stub "$LAB_TAG_GOOD" \
-    '["sh","-c","while true; do printf '"'"'HTTP/1.1 200 OK\\r\\nContent-Length: 3\\r\\nConnection: close\\r\\n\\r\\nok\\n'"'"' | nc -l -p 8080; done"]'
+docker image inspect nginx:alpine >/dev/null 2>&1 || docker pull nginx:alpine >/dev/null
+build_good_stub "$LAB_TAG_GOOD"
 build_stub "$LAB_TAG_BAD" \
     '["sh","-c","sleep 3600"]'
 build_browser_stub "$LAB_TAG_GOOD"
@@ -482,6 +567,112 @@ else
     else
         fail ".env holds the browser digest '$BROWSER_DIGEST', expected '$GOOD_BROWSER_DIGEST'"
     fi
+fi
+rm -f "$OUT"
+
+# ==============================================================================
+step "T10 — the route is really applied: the snippet lands in the proxy's conf.d"
+# The defect this catches: the deploy declared the route's name in the play's
+# `vars:`, and the play's `vars_files` — the caddy role's defaults, where
+# caddy_route_name is "" ("no route") — outranks it. The name therefore
+# arrived at routes.yml empty, the block at the top of routes.yml was skipped
+# (`when: caddy_route_name | length > 0`), and the deploy finished green with
+# no route on the server: the container was up and nothing pointed at it.
+#
+# The check is on the FILE the route leaves behind, not on the exit code: a
+# deploy that reports success and writes nothing is exactly the failure, and
+# it is invisible to every other check in this suite.
+#
+# The proxy is the caddy role's own, bootstrapped from site.yml — the same
+# role and the same playbook the VPS uses.
+#
+# The snippets of an earlier run are cleared first. The lab directory can
+# survive a run (the trash helper may refuse to remove it), and a snippet left
+# over from an earlier run would make this step pass without the route having
+# been applied at all — which is the very failure this step is about.
+rm -f "$CADDY_LAB_BASE/conf.d/"*.caddy >/dev/null 2>&1 || true
+OUT="$(mktemp)"
+if ansible-playbook -i "$INVENTORY" "$REPO_ROOT/site.yml" "${CADDY_LAB_VARS[@]}" > "$OUT" 2>&1; then
+    pass "the lab proxy is up"
+else
+    fail "the lab proxy did not come up"
+    tail -30 "$OUT"
+fi
+rm -f "$OUT"
+
+# The route is applied without the probe first. The probe inside routes.yml
+# asks the route in the same second as the reload, and the certificate for a
+# .localhost name is issued by Caddy's own CA a moment later — so a probe
+# fired right after the reload is a race the lab would lose. The lab asks the
+# route itself, with a wait, in the step below.
+OUT="$(mktemp)"
+if play_routes \
+    -e "wbparser_hostname=$LAB_SITE" \
+    -e "caddy_route_url=" \
+    "${CADDY_LAB_VARS[@]}" > "$OUT" 2>&1; then
+    if grep -q "Install the snippet" "$OUT"; then
+        pass "the deploy applied the route"
+    else
+        fail "the deploy did not apply the route — it skipped the route entirely"
+        tail -40 "$OUT"
+    fi
+else
+    fail "the deploy did not apply the route"
+    tail -40 "$OUT"
+fi
+rm -f "$OUT"
+
+SNIPPET="$CADDY_LAB_BASE/conf.d/wbparser.caddy"
+if [[ -f "$SNIPPET" ]]; then
+    pass "the route snippet was written to $SNIPPET"
+else
+    fail "the route snippet was not written to $SNIPPET — the route was never applied"
+fi
+
+if grep -q "$LAB_SITE" "$SNIPPET" 2>/dev/null; then
+    pass "the snippet carries the site address"
+else
+    fail "the snippet does not carry the site address"
+fi
+
+if grep -q "$LAB_CONTAINER:8080" "$SNIPPET" 2>/dev/null; then
+    pass "the snippet points at the crawler"
+else
+    fail "the snippet does not point at the crawler"
+fi
+
+# The route is not just on disk, it serves. A snippet that was written but
+# does not answer is a route that does not exist for anyone.
+if wait_for_route 60; then
+    pass "the proxy answers through the applied route"
+else
+    fail "the route was written but the proxy does not answer through it"
+fi
+
+# And the deploy says so itself: the same run, now with the probe switched on.
+# The probe asks the route for the crawler's liveness endpoint and fails the
+# run when the route does not answer — so a green run here means the route the
+# deploy wrote is the route that answers.
+#
+# The task header is looked for as well: a run that skipped the route entirely
+# is green too, and green is exactly what the bug looked like.
+OUT="$(mktemp)"
+if play_routes \
+    -e "wbparser_hostname=$LAB_SITE" \
+    -e "wbparser_route_url=https://$LAB_SITE:$LAB_HTTPS_PORT/api/health/live" \
+    -e "caddy_route_insecure=true" \
+    -e "caddy_route_resolve=$LAB_SITE:$LAB_HTTPS_PORT:127.0.0.1" \
+    -e "caddy_route_timeout=30" \
+    "${CADDY_LAB_VARS[@]}" > "$OUT" 2>&1; then
+    if grep -q "Probe the route end to end" "$OUT"; then
+        pass "the deploy's own probe asked the route, and the route answered"
+    else
+        fail "the deploy did not probe the route at all"
+        tail -40 "$OUT"
+    fi
+else
+    fail "the deploy's own probe did not answer through the route it applied"
+    tail -40 "$OUT"
 fi
 rm -f "$OUT"
 
