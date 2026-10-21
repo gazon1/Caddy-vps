@@ -83,10 +83,6 @@
     wbparser_compose_src: >-
       {{ lookup('env', 'WBPARSER_COMPOSE_SRC') | default('', true) }}
 
-    caddy_route_name: "{{ wbparser_route_name }}"
-    # Validated against the same regex routes.yml enforces, before the import.
-    caddy_route_url: "{{ wbparser_route_url }}"
-
   roles:
     - role: adsbrowser_api
       tags: [adsbrowser-api]
@@ -106,6 +102,32 @@
 
     - name: Apply the route
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../roles/caddy/tasks/routes.yml"
+      # Имя и адрес маршрута задаются ЗДЕСЬ, на уровне задачи, а не в vars
+      # плейбука. Причина — приоритет переменных в Ansible:
+      #
+      #   extra vars (-e) > vars задачи > vars блока > vars роли >
+      #   include_vars > set_fact > vars плейбука > vars_files плейбука >
+      #   умолчания роли
+      #
+      # vars_files этого плейбука подключает умолчания роли caddy, где
+      # caddy_route_name: "" — «маршрута нет». Умолчания из vars_files
+      # перебивают vars плейбука, поэтому объявленное там имя до routes.yml НЕ
+      # доходило: первый блок routes.yml начинается с
+      # `when: caddy_route_name | length > 0`, и при пустом имени весь блок
+      # пропускался. Маршрут не появлялся на сервере, а выкат выглядел
+      # успешным — контейнер поднялся, а пути к нему не было.
+      #
+      # У переменной уровня задачи приоритет выше и у vars_files, и у vars
+      # плейбука, и при этом она стоит РЯДОМ с задачей, которая применяет
+      # маршрут: видно, что имя берётся именно здесь.
+      #
+      # caddy_route_name проверяется тем же регулярным выражением, что и в
+      # routes.yml (^[a-z0-9][a-z0-9-]*$), и не может выйти за пределы
+      # conf.d. caddy_route_url — адрес, который routes.yml опрашивает после
+      # применения маршрута: пустой адрес означает «не опрашивать».
+      vars:
+        caddy_route_name: "{{ wbparser_route_name }}"
+        caddy_route_url: "{{ wbparser_route_url }}"
       when: wbparser_hostname | length > 0
       tags: [caddy_routes]
 
@@ -126,6 +148,14 @@
     # arguments carry the secret, and an argument list is exactly what a
     # verbose Ansible run prints. The answer is reported by the task below,
     # which has the status code and no secret.
+    #
+    # The two catalog tasks carry their own tag, `catalog_probe`, next to
+    # `caddy_routes`. The route and the catalog are two different questions,
+    # and the lab needs to be able to ask only the first one: the lab has no
+    # catalog to ask — there is no database and no catalog API behind it — so
+    # it applies the route with `--skip-tags catalog_probe` and asserts on the
+    # route itself. The tag changes nothing for a deploy that names no tags:
+    # both tasks still run.
     - name: Ask the catalog whether it can answer
       ansible.builtin.command:
         argv:
@@ -158,7 +188,7 @@
         # выкатом.
         - not ansible_check_mode
         - wbparser_hostname | length > 0
-      tags: [caddy_routes]
+      tags: [caddy_routes, catalog_probe]
 
     - name: Report what the catalog answered
       ansible.builtin.fail:
@@ -173,7 +203,7 @@
         - not ansible_check_mode
         - wbparser_hostname | length > 0
         - _wbparser_catalog_probe.stdout | trim != '200'
-      tags: [caddy_routes]
+      tags: [caddy_routes, catalog_probe]
 
     - name: Remove the route
       ansible.builtin.file:
