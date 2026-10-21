@@ -20,6 +20,7 @@
 #   T10 — the route is really applied: the snippet lands in the proxy's conf.d
 #         and the proxy answers through it
 #   T11 — a registry answer that names no digest is refused, and nothing changes
+#   T12 — the first apply of a route waits for the certificate it does not have yet
 #
 # The images come from a throwaway registry on localhost, not from GHCR: the
 # lab needs two images in the SAME repository, one that becomes healthy and one
@@ -779,6 +780,49 @@ else
 fi
 rm -f "$OUT"
 rm -rf "$FAKE_BIN" "$FAKE_BIN_NO_DIGEST"
+
+# ==============================================================================
+step "T12 — the first apply of a route waits for the certificate it does not have yet"
+# The defect this catches: the probe asked the route once, right after the
+# reload, and failed when the answer did not come. On the first apply of a
+# route there is no certificate yet — Caddy issues it in the background — so
+# the handshake cannot complete, and the deploy failed for a state that is
+# normal for a first deploy. The route was applied and everything was fine.
+#
+# The route goes to a FRESH address, so the proxy has no certificate for it
+# and has to issue one while the deploy is waiting. Before the fix this step
+# failed; now the probe waits and the deploy ends green.
+FRESH_SITE="wb-parser-fresh.localhost"
+OUT="$(mktemp)"
+if play_routes \
+    -e "wbparser_hostname=$FRESH_SITE" \
+    -e "caddy_route_name=wbparser-fresh" \
+    -e "wbparser_route_url=https://$FRESH_SITE:$LAB_HTTPS_PORT/api/health/live" \
+    -e "caddy_route_insecure=true" \
+    -e "caddy_route_resolve=$FRESH_SITE:$LAB_HTTPS_PORT:127.0.0.1" \
+    -e "caddy_route_timeout=10" \
+    "${CADDY_LAB_VARS[@]}" > "$OUT" 2>&1; then
+    pass "the deploy waited for the certificate and finished green"
+    if grep -q "RETRYING" "$OUT"; then
+        pass "the probe retried instead of asking once"
+    else
+        info "the certificate was ready before the first probe — the wait was not needed this time"
+    fi
+else
+    fail "the deploy failed on a route whose certificate was still being issued"
+    tail -40 "$OUT"
+    # Что сказал прокси: без этого причину приходится искать по всей системе.
+    echo "    --- the proxy's own log (last 15 lines):"
+    docker logs "$CADDY_LAB_CONTAINER" 2>&1 | tail -15 | sed 's/^/    /'
+fi
+rm -f "$OUT"
+
+# The route for the fresh address must not have broken the first one.
+if ask_route >/dev/null 2>&1; then
+    pass "the first route still answers"
+else
+    fail "the first route stopped answering"
+fi
 
 # ==============================================================================
 echo
