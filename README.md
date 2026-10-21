@@ -172,7 +172,7 @@ just wbshop-deploy --tags flyway ...
 just wbshop-deploy --tags wbshop ...
 
 # Dry-run
-just wbshop-deploy ... -- --check --diff
+just wbshop-deploy ... --check --diff
 ```
 
 ## Deploying the crawler from GitHub Actions
@@ -233,15 +233,67 @@ when the certificates expire. It applies nothing — the workflow skips the
 re-render the base configuration and reload Caddy.
 
 `check_only=true` adds Ansible's `--check`: the playbook is evaluated, the
-changes are shown, and nothing is applied. **Known limitation:** the `wbparser`
-and `adsbrowser` roles are not written for check mode — they read the result of
-a probe that check mode skips — so the dry run stops early with an error about
-an undefined result instead of printing a complete diff. Nothing is applied
-when that happens. Use `status_only` to look at production, and treat
-`check_only=false` as the real thing.
+changes are shown, and nothing is applied. The roles are written for check
+mode, so the dry run reaches the end and prints a complete diff — see
+[Dry run (check mode)](#dry-run-check-mode) for what it shows and what it
+does not. Use `status_only` to look at production, and treat `check_only=false`
+as the real thing.
 
 `check_only=false` is the deploy. It is a deliberate choice, made by a person
 in the dispatch form.
+
+## Dry run (check mode)
+
+A dry run shows what a deploy would change and applies none of it:
+
+```bash
+just wbparser-deploy -e wbparser_tag=<sha> --check --diff
+# or, by hand:
+ansible-playbook playbooks/wbparser.yml -e wbparser_tag=<sha> --check --diff
+```
+
+The same flags work for the other playbooks (`just bootstrap --check`,
+`just route <name> <file> --check`). Note that `just` passes the arguments
+through as they are: there is no `--` separator to put before them.
+
+**What a dry run shows**
+
+- **The digest the tag names.** The registry is asked which digest
+  `wbparser_tag` points at, and the answer appears in the diff of `.env` and
+  of the state files. This is the one thing the dry run really executes —
+  see below.
+- **The diff of every file the deploy writes**: `docker-compose.vps.yml`,
+  `.env`, `app.env`, `browser.env`, the two state files, the AdsPower
+  systemd unit, `adsbrowser.env` and the route snippet.
+- **The preflight checks**: a missing tag, password or catalog key still
+  fails the run, in a dry run exactly as in a real one.
+
+**What a dry run does not show — and does not do**
+
+- **Nothing is applied.** `changed=N` in the recap counts the tasks that
+  *would* change something; the files on disk are untouched. That is what
+  `--check` means, and it is also why `--diff` is worth passing: the diff is
+  the whole point of the run.
+- **No container is started and no service is restarted.** Compose is not
+  called, the health gates are not checked, the AdsPower Local API is not
+  probed and the headless browser is not launched. The dry run does not claim
+  to have verified any of that: those tasks are skipped, visibly.
+- **The configuration is not validated.** `caddy validate` would check the
+  *old* configuration, because the new snippet is not installed in a dry run
+  — so it is skipped instead of reporting a meaningless success.
+- **The rollback is not exercised.** It only matters once something has been
+  applied, and in a dry run nothing was.
+
+**The one command that really runs**
+
+`docker buildx imagetools inspect` — the query that resolves a tag to a
+digest — is executed even in a dry run (`check_mode: false` in
+`roles/wbparser/tasks/resolve-digest.yml`). It only *reads* the registry: it
+does not pull the image and changes nothing on the host. Without it the dry
+run could not say which image would be deployed, and the whole diff would be
+guesswork. Every other command in the roles is skipped in a dry run, and the
+tasks that read their results are skipped with them — a command that does not
+run has no result, and there is nothing to read.
 
 ## Configuration
 
