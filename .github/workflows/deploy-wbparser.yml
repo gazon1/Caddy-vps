@@ -135,15 +135,34 @@ jobs:
       # пустой. Без этого первый же ssh умирает с "Host key verification
       # failed". Ключ здесь ОТВЕРЖАЕТСЯ, а не отключается: иначе MITM молча
       # перехватил бы выкат.
+      #
+      # Повтор и диагностика — потому что молчаливый отказ здесь ничего не
+      # говорит. `ssh-keyscan` без ключей умирает тихо, и «не отвечает порт»,
+      # «хост отверг ключ» и «порт закрыт» выглядят в логе одинаково. Хост
+      # ответил один раз и перестал — и прогон падал на строке, которая не
+      # говорит ни о чём. Теперь шаг повторяется (порт мог не открыться вовремя
+      # после перезапуска), а при неудаче печатает, что именно не сошлось.
       - name: Довериться ключу хоста VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p ~/.ssh
-          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+          for attempt in 1 2 3; do
+            if ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
+              chmod 600 ~/.ssh/known_hosts
+              echo "the host key is on port $VPS_PORT (attempt $attempt)"
+              exit 0
+            fi
+            echo "::notice::попытка $attempt: хост не отдал ключ на порту $VPS_PORT"
+            sleep 10
+          done
+          echo "::error::VPS не отдал ключ хоста на порту $VPS_PORT за три попытки."
+          echo "::error::Это не ошибка ключа: сканирование молчит и при закрытом порте, и при недоступном хосте."
+          echo "::error::Проверить: nc -vz <host> $VPS_PORT — и доступность машины, и состояние sshd на ней."
+          echo "::error::Ответ сканирования: $(tr '\n' ' ' < /tmp/keyscan.err)"
+          exit 1
 
       # ssh-agent, а не голый openssh: проверка ключа хоста остаётся включённой.
       # v0.10.0 принимает только `ssh-private-key` — хост, пользователя и порт
