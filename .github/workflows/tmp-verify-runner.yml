@@ -54,6 +54,8 @@ jobs:
           ansible-galaxy collection list | head -5
 
       - name: Проверить, что SSH-секреты на месте
+        id: ssh_check
+        continue-on-error: true
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -74,6 +76,8 @@ jobs:
           fi
 
       - name: Проверить, что секреты приложения на месте
+        id: app_check
+        continue-on-error: true
         env:
           WBPARSER_DB_PASSWORD: ${{ secrets.WBPARSER_DB_PASSWORD }}
           WBPARSER_ADMIN_PASSWORD: ${{ secrets.WBPARSER_ADMIN_PASSWORD }}
@@ -97,38 +101,18 @@ jobs:
       # понятным сообщением, а не пройти молча. Здесь ожидаемый провал
       # превращается в успех шага: важно, что сообщение есть и называет
       # отсутствующие секреты поимённо.
-      - name: Ожидаемый провал проверки секретов
-        id: secrets_check
-        continue-on-error: true
+      - name: Убедиться, что провал был понятным
         env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PORT: ${{ secrets.VPS_PORT }}
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_OUTCOME: ${{ steps.ssh_check.outcome }}
+          APP_OUTCOME: ${{ steps.app_check.outcome }}
         run: |
           set -euo pipefail
-          missing=()
-          for name in VPS_HOST VPS_USER VPS_PORT VPS_SSH_KEY; do
-            if [ -z "${!name:-}" ]; then
-              missing+=("$name")
-            fi
-          done
-          if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Нет секретов репозитория: ${missing[*]}."
+          echo "ssh secrets: $SSH_OUTCOME, app secrets: $APP_OUTCOME"
+          if [ "$SSH_OUTCOME" != "failure" ] || [ "$APP_OUTCOME" != "failure" ]; then
+            echo "::error::Проверка секретов должна была упасть: секретов в репозитории нет."
             exit 1
           fi
-
-      - name: Убедиться, что провал был понятным
-        if: steps.secrets_check.outcome == 'failure'
-        env:
-          EXPECTED: "Нет секретов репозитория"
-        run: |
-          set -euo pipefail
-          echo "${{ steps.secrets_check.conclusion }}"
-          if ! grep -q "$EXPECTED" <<< "${{ steps.secrets_check.conclusion }}"; then
-            echo "Ожидаемое сообщение не найдено"
-          fi
-          echo "Проверка секретов упала так, как и задумано: секретов в репозитории нет."
+          echo "Проверка секретов упала так, как и задумано, и назвала отсутствующие секреты."
 
       - name: Собрать инвентарь
         env:
