@@ -14,6 +14,15 @@
 # the same index, but the digest sits in a per-platform Descriptor and has to
 # be picked out of nested JSON.
 #
+# The digest is read from the TEXT of that answer, not from a buildx template.
+# Шаблон `--format '{{.Manifest.Digest}}'` опирается на структуру, которую
+# buildx менял: на раннере GitHub Actions запрос к образу с attestation-
+# манифестами вернул обычный листинг вместо поля, и роль — правильно —
+# отказалась катить образ, который не назван. Текстовый ответ стабильнее:
+# строка `Digest:` в его начале — это digest индекса, и её форма не зависит
+# от версии buildx. Шаблон остался бы в этой роли одной нестабильной
+# зависимостью, из-за которой выкат в прод не проходит.
+#
 # Included twice: once for the tag the operator asked for, and once for the
 # legacy tag the previous state file format left behind.
 #
@@ -37,8 +46,6 @@
       - imagetools
       - inspect
       - "{{ wbparser_resolve_ref }}"
-      - --format
-      - "{% raw %}{{.Manifest.Digest}}{% endraw %}"
   register: _wbparser_resolve
   changed_when: false
   failed_when: false
@@ -46,6 +53,30 @@
   # Здесь это единственное исключение: запрос к реестру ничего не меняет на
   # хосте, а без него сухой прогон не показал бы, какой образ развернулся бы.
   check_mode: false
+
+# Версия buildx — в сообщение об отказе. Разбор ответа зависит от того, что
+# реестр и buildx печатают; когда это меняется, версия объясняет почему
+# раньше работало, а теперь нет, и не заставляет искать причину по всему
+# окружению.
+- name: The buildx that answers
+  ansible.builtin.command:
+    argv:
+      - docker
+      - buildx
+      - version
+  register: _wbparser_buildx
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# Digest индекса — первая строка `Digest:` в ответе. Строки ниже относятся к
+# манифестам внутри индекса и на ответ не влияют.
+- name: The digest the registry answered with
+  ansible.builtin.set_fact:
+    _wbparser_digest: >-
+      {{ ((_wbparser_resolve.stdout | default(''))
+          | regex_findall('(?m)^Digest:\s+(sha256:[0-9a-f]{64})\s*$')
+          | first) | default('', true) }}
 
 # `default(1)` — не «прячем отсутствие результата», а честная обработка: если
 # ответа нет вообще (задача была пропущена), это не ответ реестра, и отказ
@@ -61,20 +92,24 @@
       {{ '\n' }}
       Registry said: {{ (_wbparser_resolve.stderr | default('')) | trim }}
       {{ (_wbparser_resolve.stdout | default('')) | trim }}
+      {{ '\n' }}
+      buildx: {{ (_wbparser_buildx.stdout | default('')) | trim }}
   when: (_wbparser_resolve.rc | default(1)) != 0
 
 - name: Refuse a resolution that is not a digest
   ansible.builtin.fail:
     msg: >-
       The registry answered for {{ wbparser_resolve_ref }} with
-      "{{ _wbparser_resolve.stdout | default('') | trim | truncate(200) }}",
-      which is not a sha256:<64 hex> digest. A deploy that cannot name the
-      exact image must not proceed.
+      "{{ _wbparser_resolve.stdout | default('') | trim | truncate(400) }}",
+      which does not name a sha256:<64 hex> digest. A deploy that cannot name
+      the exact image must not proceed.
       {{ wbparser_resolve_note | default('') }}
+      {{ '\n' }}
+      buildx: {{ (_wbparser_buildx.stdout | default('')) | trim }}
   when:
     - (_wbparser_resolve.rc | default(0)) == 0
-    - ((_wbparser_resolve.stdout | default('')) | trim | regex_search('^sha256:[0-9a-f]{64}$') is none)
+    - (_wbparser_digest | default('')) | length == 0
 
 - name: Remember the resolved digest
   ansible.builtin.set_fact:
-    wbparser_resolved_digest: "{{ (_wbparser_resolve.stdout | default('')) | trim }}"
+    wbparser_resolved_digest: "{{ _wbparser_digest | default('') }}"
