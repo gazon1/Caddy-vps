@@ -140,6 +140,27 @@ jobs:
           echo "::error::Проверить: nc -vz <host> $VPS_PORT — и доступность машины, и состояние sshd на ней."
           exit 1
 
+      # ssh-agent, а не голый openssh: проверка ключа хоста остаётся включённой.
+      # v0.10.0 принимает только `ssh-private-key` — хост, пользователя и порт
+      # из его входов убрали, и передача их даёт "ssh-private-key argument is
+      # empty". Порт уезжает вместе с каждым `ssh -p`.
+      - name: Настроить SSH
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      # Отдельная проверка вместо того, чтобы ждать таймаута Ansible: так в логе
+      # видно, что именно не работает — раннер не дотягивается до VPS.
+      - name: Проверить, что раннер дотягивается до VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          ssh -p "$VPS_PORT" -o ConnectTimeout=15 -o BatchMode=yes \
+            "$VPS_USER@$VPS_HOST" "echo ok"
+
       - name: Собрать инвентарь
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
