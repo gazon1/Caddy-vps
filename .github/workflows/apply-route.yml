@@ -147,16 +147,23 @@ jobs:
           VPS_PORT: ${{ secrets.VPS_PORT }}
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/inventory.yml" <<EOF
-          all:
-            hosts:
-              vps-1:
-                ansible_host: ${VPS_HOST}
-                ansible_user: ${VPS_USER}
-                ansible_port: ${VPS_PORT}
-                ansible_become: true
-                ansible_become_method: sudo
-          EOF
+          # The group matters: the playbooks target `hosts: vps`, and a flat
+          # inventory with the host under `all` matches nothing — the play then
+          # ends with "skipping: no hosts matched" and the run is GREEN while
+          # nothing happened. That is the worst kind of green.
+          printf '%s\n' \
+            '---' \
+            'all:' \
+            '  children:' \
+            '    vps:' \
+            '      hosts:' \
+            '        vps-1:' \
+            "          ansible_host: ${VPS_HOST}" \
+            "          ansible_user: ${VPS_USER}" \
+            "          ansible_port: ${VPS_PORT}" \
+            '          ansible_become: true' \
+            '          ansible_become_method: sudo' \
+            > "$RUNNER_TEMP/inventory.yml"
           echo "inventory: $RUNNER_TEMP/inventory.yml"
 
       - name: Применить маршрут
