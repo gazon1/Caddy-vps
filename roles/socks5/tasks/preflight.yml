@@ -9,15 +9,22 @@
 # that will not start.
 # ==============================================================================
 
-# The password comes from the environment when it was not given. NOT from the
-# command line: a command line is visible in the process list and in the shell
-# history.
-- name: Resolve the password from the environment when it was not given
+# The password of THIS endpoint: the host's own value, then the one the operator
+# passed for the whole play, then the environment.
+#
+# Every endpoint has its own password, and a rotation of one must not touch the
+# others — so the host's own value wins. The order matters: the host's value is
+# what the vault holds for that host, and the fallbacks are for the case where
+# the operator runs the whole fleet with one password.
+#
+# Not from the command line: a command line is visible in the process list and in
+# the shell history.
+- name: Resolve the password of this endpoint
   ansible.builtin.set_fact:
     socks5_password: >-
-      {{ socks5_password
+      {{ hostvars[inventory_hostname].socks5_password
+         | default(socks5_password | default('', true), true)
          | default(lookup('env', 'SOCKS5_PASSWORD') | default('', true), true) }}
-  when: not (socks5_password | default('') | length > 0)
   no_log: true
 
 # The password is checked on its own, in a task whose message says nothing

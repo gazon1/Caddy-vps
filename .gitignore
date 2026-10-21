@@ -6,6 +6,11 @@
 
 # Secrets. Copy .env.example, fill it in, keep it out of git.
 .env
+# The local inventory of the egress endpoints. It holds the real addresses of
+# the hosts that carry them — and a crawler’s egress addresses do not belong in
+# a public repository. The committed inventory keeps the SHAPE, not the values.
+inventory/*.local.yml
+
 # Ansible vault — encrypted secrets (group_vars/*/vault.yml)
 vault.yml
 *.vault
