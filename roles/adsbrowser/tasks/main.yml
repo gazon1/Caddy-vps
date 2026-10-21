@@ -106,9 +106,18 @@
   register: _adsbrowser_already_installed
   changed_when: false
   failed_when: false
+  # В check mode команда не выполняется — результата нет, и читать нечего.
+  # Проба отвечает на вопрос «стоит ли ставить CLI», и в dry run этот вопрос
+  # не задаётся: блок установки ниже тоже пропускается.
+  when: not ansible_check_mode
 
 - name: Install adspower-browser from local tarball
-  when: _adsbrowser_already_installed.rc != 0
+  when:
+    # В check mode блок пропускается: команда-проба не выполнялась, ответа у
+    # неё нет, и «установлено или нет» неизвестно. Показывать установку, о
+    # которой неизвестно, нужно ли, было бы враньём в diff.
+    - not ansible_check_mode
+    - (_adsbrowser_already_installed.rc | default(1)) != 0
   block:
     - name: Verify tarball is present on control node
       ansible.builtin.stat:
@@ -137,17 +146,24 @@
         argv: [sha256sum, "/tmp/adspower-browser-{{ adsbrowser_cli_version }}.tgz"]
       register: adsbrowser_tarball_sha256
       changed_when: false
+      # В check mode файл на хосте не появился (copy в dry run только
+      # показывает diff), хешировать нечего, а команда в check mode и не
+      # выполняется. Проверка целостности — это проверка, и в dry run её
+      # пропускать нельзя молча: она пропускается явно.
+      when: not ansible_check_mode
 
     - name: Fail when tarball sha256 does not match expected value
       ansible.builtin.fail:
         msg: >-
           Tarball sha256 mismatch.
           Expected: {{ adsbrowseradsbrowser_tarball_sha256 }}
-          Got:      {{ adsbrowser_tarball_sha256.stdout | trim | split | last }}
+          Got:      {{ (adsbrowser_tarball_sha256.stdout | default('')) | trim | split | last }}
           The tarball on the control node is corrupted or has been replaced without
           updating adsbrowseradsbrowser_tarball_sha256 in defaults/main.yml.
-      when: >-
-        (adsbrowser_tarball_sha256.stdout | trim | split | last) != adsbrowseradsbrowser_tarball_sha256
+      when:
+        - not ansible_check_mode
+        - ((adsbrowser_tarball_sha256.stdout | default('')) | trim | split | last)
+          != adsbrowseradsbrowser_tarball_sha256
 
     - name: Install adspower-browser from tarball
       ansible.builtin.command:
@@ -167,10 +183,15 @@
   register: _adsbrowser_version_check
   changed_when: false
   failed_when: false
+  # В check mode команда не выполняется — версии у нас нет.
+  when: not ansible_check_mode
 
 - name: Report adspower-browser version
   ansible.builtin.debug:
     msg: "adspower-browser {{ _adsbrowser_version_check.stdout | default('unknown') | trim }}"
+  # В check mode версия не проверялась, поэтому и показывать её не из чего:
+  # пустая строка выглядела бы как «версия неизвестна», а это неправда.
+  when: not ansible_check_mode
 
 # ── Environment configuration ──────────────────────────────────────────────────
 
@@ -239,6 +260,10 @@
     state: started
     daemon_reload: true
   become: true
+  # В check mode systemd ничего не запускает, а юнит-файла на хосте ещё нет
+  # (copy в dry run только показывает diff) — модуль упал бы с «юнит не
+  # найден». Пропускаем явно: сухой прогон не включает и не запускает сервисы.
+  when: not ansible_check_mode
 
 # Fix #7: Deploy logrotate configuration for xvfb and adsbrowser logs
 - name: Deploy logrotate config for adsbrowser logs
@@ -278,6 +303,9 @@
   register: adsbrowser_container_check
   changed_when: false
   failed_when: false
+  # В check mode команда не выполняется — состояния чужого контейнера мы не
+  # знаем, и врать про него нельзя.
+  when: not ansible_check_mode
 
 - name: Report that the foreign adspower container is not there
   ansible.builtin.debug:
@@ -286,7 +314,10 @@
       not running here. Nothing to do about it: the AdsPower runtime this
       deployment uses is the wb-parser-browser image, and the Local API is
       checked below.
-  when: adsbrowser_container_check.rc != 0 or adsbrowser_container_check.stdout | trim != 'running'
+  when:
+    - not ansible_check_mode
+    - (adsbrowser_container_check.rc | default(1)) != 0
+      or (adsbrowser_container_check.stdout | default('')) | trim != 'running'
 
 # ── AdsPower Local API connectivity check (fix #5 — hard failure) ────────────────
 
@@ -296,25 +327,33 @@
   register: _adsbrowser_api_check
   changed_when: false
   # FIX #5: Removed failed_when: false — a non-zero exit IS a failure
+  # В check mode команда не выполняется — ответа Local API нет, и читать
+  # нечего. Проба описывает состояние хоста прямо сейчас, а выкат может это
+  # состояние как раз и починить, поэтому сухой прогон на нём не падает.
+  when: not ansible_check_mode
 
 - name: Report AdsPower Local API status
   ansible.builtin.debug:
     msg: "AdsPower Local API: {{ _adsbrowser_api_check.stdout | default(_adsbrowser_api_check.stderr) | trim }}"
-  when: _adsbrowser_api_check.rc == 0
+  when:
+    - not ansible_check_mode
+    - (_adsbrowser_api_check.rc | default(1)) == 0
 
 - name: Fail when AdsPower Local API is not reachable
   ansible.builtin.fail:
     msg: >-
       AdsPower Local API is not reachable at {{ adsbrowser_endpoint }}:{{ adsbrowser_api_port }}.
-      Exit code: {{ _adsbrowser_api_check.rc }}
-      Output: {{ _adsbrowser_api_check.stdout | default('') | trim }}
-      Stderr: {{ _adsbrowser_api_check.stderr | default('') | trim }}
+      Exit code: {{ (_adsbrowser_api_check.rc | default(1)) }}
+      Output: {{ (_adsbrowser_api_check.stdout | default('')) | trim }}
+      Stderr: {{ (_adsbrowser_api_check.stderr | default('')) | trim }}
 
       The AdsPower runtime that serves this API is the wb-parser-browser
       image, deployed by the wbparser role. Deploy it, and check that the
       service is up:
         docker ps --filter name=wb-parser-browser
-  when: _adsbrowser_api_check.rc != 0
+  when:
+    - not ansible_check_mode
+    - (_adsbrowser_api_check.rc | default(1)) != 0
 
 # ── Headless browser launch verification ──────────────────────────────────────
 # Fix #10: Replaced shell/command guessing with proper deterministic checks.
@@ -324,7 +363,13 @@
     _adsbrowser_has_test_profile: "{{ adsbrowser_test_profile_id | length > 0 }}"
 
 - name: Launch browser in headless mode for verification
-  when: _adsbrowser_has_test_profile | bool
+  when:
+    # Сухой прогон не должен поднимать браузер. Это единственная проба в
+    # репозитории, которая запускает настоящий браузер, и обещание «ничего
+    # не выполняется» должно быть правдой: headless-запуск в check mode не
+    # выполняется, результата нет, и читать нечего.
+    - not ansible_check_mode
+    - _adsbrowser_has_test_profile | bool
   block:
 
     - name: Open browser profile in headless mode
@@ -354,10 +399,10 @@
           - "{{ adsbrowser_api_port }}"
       register: _adsbrowser_opened_check
       changed_when: false
-      until: _adsbrowser_opened_check.stdout | regex_search(adsbrowser_test_profile_id) | length > 0
+      until: (_adsbrowser_opened_check.stdout | default('')) | regex_search(adsbrowser_test_profile_id) | length > 0
       retries: 10
       delay: 3
-      when: _adsbrowser_headless_open.rc == 0
+      when: (_adsbrowser_headless_open.rc | default(1)) == 0
 
     - name: Close the verification browser
       ansible.builtin.command:
@@ -375,11 +420,11 @@
     - name: Assert headless browser was opened successfully
       ansible.builtin.assert:
         that:
-          - "_adsbrowser_headless_open.rc == 0"
+          - "(_adsbrowser_headless_open.rc | default(1)) == 0"
         fail_msg: >-
-          Headless browser launch failed (exit {{ _adsbrowser_headless_open.rc }}).
-          stdout: {{ _adsbrowser_headless_open.stdout | default('') | trim }}
-          stderr: {{ _adsbrowser_headless_open.stderr | default('') | trim }}
+          Headless browser launch failed (exit {{ (_adsbrowser_headless_open.rc | default(1)) }}).
+          stdout: {{ (_adsbrowser_headless_open.stdout | default('')) | trim }}
+          stderr: {{ (_adsbrowser_headless_open.stderr | default('')) | trim }}
       when: _adsbrowser_has_test_profile | bool
 
 - name: Warn when no test profile is configured
@@ -388,18 +433,32 @@
       adsbrowser_test_profile_id is not set — skipping headless launch verification.
       To verify headless operation end-to-end:
         just adsbrowser-deploy -e adsbrowser_api_key=<key> -e adsbrowser_test_profile_id=kxpu63n
-  when: not (_adsbrowser_has_test_profile | default(false) | bool)
+  when:
+    - not ansible_check_mode
+    - not (_adsbrowser_has_test_profile | default(false) | bool)
 
 # ── Final report ───────────────────────────────────────────────────────────────
 
 - name: Report adsbrowser setup status
   ansible.builtin.debug:
     msg:
-      - "adspower-browser CLI : {{ _adsbrowser_version_check.stdout | default('unknown') | trim }}"
-      - "Xvfb systemd service : enabled + started (display :99)"
+      - >-
+        adspower-browser CLI :
+        {{ 'not checked (dry run)' if ansible_check_mode
+           else _adsbrowser_version_check.stdout | default('unknown') | trim }}
+      # В check mode systemd ничего не включал и не запускал — показывать
+      # «enabled + started» было бы враньём.
+      - >-
+        Xvfb systemd service :
+        {{ 'would be enabled + started (display :99)' if ansible_check_mode
+           else 'enabled + started (display :99)' }}
       - "DISPLAY               : :99"
       - "AdsPower API          : {{ adsbrowser_endpoint }}:{{ adsbrowser_api_port }}"
+      # В check mode ни CLI, ни Local API не проверялись и браузер не
+      # поднимался: показывать «passed» было бы враньём.
       - >-
         Headless verification :
-        {{ 'passed' if _adsbrowser_has_test_profile | default(false) | bool
-           else 'skipped (no test profile)' }}
+        {{ 'not checked (dry run — nothing was started)'
+           if ansible_check_mode
+           else ('passed' if _adsbrowser_has_test_profile | default(false) | bool
+                 else 'skipped (no test profile)') }}

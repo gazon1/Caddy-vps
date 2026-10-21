@@ -14,3 +14,7 @@
       - /etc/caddy/Caddyfile
   register: caddy_validate_result
   changed_when: false
+  # В check mode команда не выполняется, а Caddyfile на хосте ещё старый:
+  # валидировать было бы НЕ то, что изменится. Проверка пропускается явно,
+  # чтобы сухой прогон не делал вид, что конфигурация проверена.
+  when: not ansible_check_mode

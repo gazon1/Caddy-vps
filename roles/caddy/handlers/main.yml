@@ -14,6 +14,9 @@
       - /etc/caddy/Caddyfile
   register: caddy_reload_result
   changed_when: true
+  # В check mode команда не выполняется, и перезагрузки не будет: сухой прогон
+  # показывает diff конфигурации, а не её применение.
+  when: not ansible_check_mode
 
 # Only a changed compose manifest needs a new container. Changing the Caddyfile
 # or a route snippet never reaches this handler.
@@ -26,3 +29,5 @@
     wait: true
     wait_timeout: "{{ caddy_health_timeout }}"
   changed_when: true
+  # В check mode контейнеры не поднимаются: сухой прогон ничего не запускает.
+  when: not ansible_check_mode

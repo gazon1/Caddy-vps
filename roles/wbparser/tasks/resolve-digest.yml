@@ -19,6 +19,15 @@
 #
 #   wbparser_resolve_ref     the reference to resolve
 #   wbparser_resolve_note    optional extra sentence for the failure message
+#
+# ── Check mode ───────────────────────────────────────────────────────────────
+# Единственное место во всей роли, где команда выполняется и в check mode.
+# `docker buildx imagetools inspect` — это ЗАПРОС к реестру: образ не
+# скачивается и ничего на хосте не меняется. Без ответа реестра сухой прогон
+# не может сказать, ЧТО изменится: в diff не попадут ни digest, ни строка
+# DIGEST= в .env. Остальные команды роли в check mode не выполняются, и
+# результата у них нет — читать нечего, и делать вид, что мы прочитали,
+# нельзя, поэтому их потребители тоже пропускаются.
 
 - name: Ask the registry for the digest behind the reference
   ansible.builtin.command:
@@ -33,7 +42,14 @@
   register: _wbparser_resolve
   changed_when: false
   failed_when: false
+  # В check mode команда по умолчанию не выполняется, и результата нет.
+  # Здесь это единственное исключение: запрос к реестру ничего не меняет на
+  # хосте, а без него сухой прогон не показал бы, какой образ развернулся бы.
+  check_mode: false
 
+# `default(1)` — не «прячем отсутствие результата», а честная обработка: если
+# ответа нет вообще (задача была пропущена), это не ответ реестра, и отказ
+# должен прозвучать здесь, а не падать на отсутствующем ключе.
 - name: Refuse to deploy an image that cannot be named
   ansible.builtin.fail:
     msg: >-
@@ -45,7 +61,7 @@
       {{ '\n' }}
       Registry said: {{ (_wbparser_resolve.stderr | default('')) | trim }}
       {{ (_wbparser_resolve.stdout | default('')) | trim }}
-  when: _wbparser_resolve.rc != 0
+  when: (_wbparser_resolve.rc | default(1)) != 0
 
 - name: Refuse a resolution that is not a digest
   ansible.builtin.fail:
@@ -55,9 +71,10 @@
       which is not a sha256:<64 hex> digest. A deploy that cannot name the
       exact image must not proceed.
       {{ wbparser_resolve_note | default('') }}
-  when: _wbparser_resolve.rc == 0
-        and (_wbparser_resolve.stdout | default('') | trim | regex_search('^sha256:[0-9a-f]{64}$') is none)
+  when:
+    - (_wbparser_resolve.rc | default(0)) == 0
+    - ((_wbparser_resolve.stdout | default('')) | trim | regex_search('^sha256:[0-9a-f]{64}$') is none)
 
 - name: Remember the resolved digest
   ansible.builtin.set_fact:
-    wbparser_resolved_digest: "{{ _wbparser_resolve.stdout | trim }}"
+    wbparser_resolved_digest: "{{ (_wbparser_resolve.stdout | default('')) | trim }}"

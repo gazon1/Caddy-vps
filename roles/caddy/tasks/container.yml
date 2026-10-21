@@ -13,3 +13,10 @@
     wait: true
     wait_timeout: "{{ caddy_health_timeout }}"
     pull: missing
+  # В check mode compose не вызывается. `docker compose up --dry-run` требует,
+  # чтобы сеть и сам compose-файл уже существовали, а в dry run их нет: файл
+  # только показан в diff, сеть не создана. На пустом хосте такой прогон
+  # падал бы с «network … declared as external, but could not be found».
+  # Сухой прогон показывает, что изменится в файлах, — контейнер он не
+  # поднимает.
+  when: not ansible_check_mode

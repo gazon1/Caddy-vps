@@ -1,5 +1,10 @@
 ---
+# Handlers are executed in check mode as well, so this one is skipped there
+# explicitly: a dry run must not reload systemd on the host.
+
 - name: Reload systemd
   ansible.builtin.systemd_service:
     daemon_reload: true
   become: true
+  # В check mode перечитывать демон нечего: юнит-файл не был записан.
+  when: not ansible_check_mode
