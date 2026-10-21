@@ -1,0 +1,38 @@
+---
+# ==============================================================================
+# Install and verify one SOCKS5 endpoint.
+#
+# One endpoint = one egress address = one egress group of the crawler. The
+# crawler is not multiplied — the addresses are. See the application
+# repository's ADR `2026-11-01-one-crawler-many-addresses`.
+#
+# What the endpoint must be:
+#   • reachable ONLY from the crawler's address — the refusal is the proxy's
+#     own, not a firewall rule that might fail open;
+#   • authenticated — no anonymous access;
+#   • idempotent — a second run changes nothing.
+#
+# Usage:
+#   just socks5-deploy
+#   just socks5-deploy -e socks5_client_cidrs='["203.0.113.10/32"]'
+# ==============================================================================
+
+- name: Gather facts
+  ansible.builtin.setup:
+  when: ansible_facts == {}
+
+- name: Preflight
+  ansible.builtin.import_tasks: preflight.yml
+  tags: [socks5]
+
+- name: The endpoint
+  ansible.builtin.import_tasks: endpoint.yml
+  tags: [socks5]
+
+- name: The service
+  ansible.builtin.import_tasks: service.yml
+  tags: [socks5]
+
+- name: The verification
+  ansible.builtin.import_tasks: verify.yml
+  tags: [socks5]

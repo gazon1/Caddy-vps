@@ -1,0 +1,82 @@
+---
+# ==============================================================================
+# Preflight — what has to be true before the endpoint is touched.
+#
+# Every check here is about one thing: an endpoint that is missing a piece of
+# its own configuration must not be installed half-configured. A proxy with no
+# allowed client is an open relay; a proxy with no password is an open relay
+# with a name; a proxy that cannot bind the address it announces is a proxy
+# that will not start.
+# ==============================================================================
+
+# The password comes from the environment when it was not given. NOT from the
+# command line: a command line is visible in the process list and in the shell
+# history.
+- name: Resolve the password from the environment when it was not given
+  ansible.builtin.set_fact:
+    socks5_password: >-
+      {{ socks5_password
+         | default(lookup('env', 'SOCKS5_PASSWORD') | default('', true), true) }}
+  when: not (socks5_password | default('') | length > 0)
+  no_log: true
+
+# The password is checked on its own, in a task whose message says nothing
+# about its value: a check that prints the secret it checked is a check that
+# leaks the secret.
+- name: Fail when the password is missing
+  ansible.builtin.fail:
+    msg: >-
+      The endpoint needs a password. Provide it from Ansible Vault
+      (socks5_password) or from the environment (SOCKS5_PASSWORD). Not on the
+      command line: it would be visible in the process list.
+  when: not (socks5_password | default('') | length > 0)
+
+- name: Fail when the endpoint's own parameters are missing
+  ansible.builtin.assert:
+    that:
+      - socks5_port | int > 0
+      - socks5_port | int < 65536
+      - socks5_username | length > 0
+      - socks5_service_mode in ['auto', 'systemd', 'none']
+    fail_msg: >-
+      The endpoint needs a port between 1 and 65535, an account and a known
+      service mode.
+      Got port={{ socks5_port }}, username='{{ socks5_username }}',
+      service_mode={{ socks5_service_mode }}.
+    quiet: true
+
+# The allowed addresses arrive in three shapes, and all three mean the same
+# thing:
+#
+#   • a list        — the inventory;
+#   • a JSON string — an operator's -e on the command line, where
+#                      -e 'socks5_client_cidrs=["203.0.113.10/32"]' arrives as
+#                      the STRING '["203.0.113.10/32"]', not as a list;
+#   • a bare CIDR   — one address, written plainly.
+#
+# The operator should not have to learn which shape this playbook prefers, so
+# all three are normalised here — once, before anything else reads them.
+- name: Normalise the allowed client addresses into a list
+  ansible.builtin.set_fact:
+    socks5_allowed_cidrs: >-
+      {{ socks5_client_cidrs
+         if socks5_client_cidrs is not string
+         else (socks5_client_cidrs | from_json
+               if socks5_client_cidrs.lstrip().startswith('[')
+               else ([socks5_client_cidrs]
+                     if ',' not in socks5_client_cidrs
+                     else socks5_client_cidrs.split(','))) }}
+
+- name: Fail when no client address is allowed
+  ansible.builtin.assert:
+    that:
+      - socks5_allowed_cidrs | length > 0
+      - socks5_allowed_cidrs | select('string') | list | length == socks5_allowed_cidrs | length
+      - socks5_allowed_cidrs | map('trim')
+        | select('match', '^[0-9a-fA-F:.]+/[0-9]+$') | list | length
+        == socks5_allowed_cidrs | length
+    fail_msg: >-
+      The endpoint needs at least one allowed client address, as a CIDR:
+      socks5_client_cidrs: ["203.0.113.10/32"]. An endpoint with no allowed
+      client is an open relay, and an address that is not a CIDR is a typo.
+    quiet: true

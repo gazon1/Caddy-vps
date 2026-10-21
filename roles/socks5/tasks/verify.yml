@@ -1,0 +1,150 @@
+---
+# ==============================================================================
+# The verification.
+#
+# The endpoint is not "installed" because the files are in place. It is
+# installed when it answers — with the right credentials, and with nobody
+# else's.
+#
+# The check speaks the SOCKS5 handshake itself (files/socks5_probe.py): no
+# echo service, no API, nothing that can be down for reasons that have nothing
+# to do with the proxy. The target is a TCP address the proxy has to open a
+# connection to.
+#
+# The probe runs through the endpoint's own loopback. An operator who turns
+# the loopback off loses the self-verification — and the role says so instead
+# of reporting a green deploy it did not verify.
+# ==============================================================================
+
+- name: Copy the probe
+  ansible.builtin.copy:
+    src: socks5_probe.py
+    dest: /tmp/socks5_probe.py
+    owner: root
+    group: root
+    mode: "0755"
+  become: "{{ socks5_become }}"
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+
+# The password travels in the environment, not in the command line: a command
+# line is visible in the process list. The task is hidden for the same reason.
+- name: Ask the endpoint whether it answers with the right credentials
+  ansible.builtin.command:
+    argv:
+      - /tmp/socks5_probe.py
+      - --host
+      - "127.0.0.1"
+      - --port
+      - "{{ socks5_port | string }}"
+      - --username
+      - "{{ socks5_username }}"
+      - --target-host
+      - "{{ socks5_probe_target_host }}"
+      - --target-port
+      - "{{ socks5_probe_target_port | string }}"
+      - --verdict-file
+      - /tmp/socks5_probe.verdict
+  environment:
+    SOCKS5_PROBE_PASSWORD: "{{ socks5_password }}"
+  register: socks5_probe_result
+  changed_when: false
+  failed_when: false
+  no_log: true
+  become: "{{ socks5_become }}"
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+
+# The verdict is a file, not the task's output: the output is hidden (it
+# carries the password in the environment), and the operator still gets to read
+# what the probe said.
+- name: Read the probe's verdict
+  ansible.builtin.command:
+    argv: [cat, /tmp/socks5_probe.verdict]
+  register: socks5_probe_verdict
+  changed_when: false
+  failed_when: false
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+
+# The endpoint must refuse a wrong password. An endpoint that accepts one is
+# not an endpoint: it is a relay for anyone who finds the port.
+- name: Ask the endpoint whether it refuses a wrong password
+  ansible.builtin.command:
+    argv:
+      - /tmp/socks5_probe.py
+      - --host
+      - "127.0.0.1"
+      - --port
+      - "{{ socks5_port | string }}"
+      - --username
+      - "{{ socks5_username }}"
+      - --target-host
+      - "{{ socks5_probe_target_host }}"
+      - --target-port
+      - "{{ socks5_probe_target_port | string }}"
+  environment:
+    SOCKS5_PROBE_PASSWORD: "wrong-password-on-purpose"
+  register: socks5_probe_wrong
+  changed_when: false
+  failed_when: false
+  become: "{{ socks5_become }}"
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+
+- name: Fail when the endpoint accepted a wrong password
+  ansible.builtin.fail:
+    msg: >-
+      The endpoint accepted a request with a wrong password. It is not
+      authenticated, and it must not be left serving.
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+    - socks5_probe_wrong.rc | default(1) == 0
+
+- name: Fail when the endpoint did not answer
+  ansible.builtin.fail:
+    msg: >-
+      The endpoint did not answer as it should.
+      {{ socks5_probe_verdict.stdout | default('the probe said nothing') | trim }}
+      The proxy's own log says more: journalctl -u danted (or /var/log/danted.log
+      when it runs without systemd).
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+    - socks5_probe_result.rc | default(1) not in [0, 3]
+
+- name: Warn when the endpoint answered but the target refused the connection
+  ansible.builtin.debug:
+    msg: >-
+      {{ socks5_probe_verdict.stdout | default('') | trim }}
+      The proxy is alive and authenticated; the target it was pointed at did
+      not answer. The endpoint's own reachability is proven.
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+    - socks5_probe_result.rc | default(1) == 3
+
+- name: Report that the endpoint answers
+  ansible.builtin.debug:
+    msg: >-
+      {{ socks5_probe_verdict.stdout | default('') | trim }}
+      A wrong password is refused.
+  when:
+    - not ansible_check_mode
+    - socks5_allow_localhost | bool
+    - socks5_probe_result.rc | default(1) == 0
+
+- name: Say that the endpoint was installed but not verified
+  ansible.builtin.debug:
+    msg: >-
+      The endpoint was installed but NOT verified: the role verifies itself
+      through the endpoint's loopback, and the loopback was not allowed
+      (socks5_allow_localhost: false). Verify it from the crawler by hand.
+  when:
+    - not ansible_check_mode
+    - not (socks5_allow_localhost | bool)

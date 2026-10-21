@@ -1,0 +1,6 @@
+---
+galaxy_info:
+  author: gazon1
+  description: Deploys a SOCKS5 endpoint — one egress address for the crawler
+  license: MIT
+  min_ansible_version: "2.12"

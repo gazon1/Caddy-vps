@@ -203,6 +203,88 @@ git revert <the commit that removed the local caddy service>
 
 ---
 
+## The SOCKS5 endpoints (egress addresses)
+
+One endpoint = one egress address = one egress group of the crawler. The crawler
+is **not** multiplied — the addresses are (see the application repository's ADR
+`2026-11-01-one-crawler-many-addresses`).
+
+### Provisioning
+
+```bash
+# The endpoint's password. From Ansible Vault or the environment — NOT on the
+# command line, where it would be visible in the process list.
+export SOCKS5_PASSWORD='…'
+just socks5-deploy
+```
+
+The hosts come from the `egress` group of `inventory/hosts.yml`. Each host names
+the client it serves:
+
+```yaml
+egress:
+  hosts:
+    egress-1:
+      ansible_host: 198.51.100.10
+      ansible_user: root
+      socks5_client_cidrs:
+        - "203.0.113.10/32"     # the crawler's address
+```
+
+The endpoint refuses every other client **itself** — the allowed list is in the
+proxy's own configuration, not in a firewall rule that might fail open.
+
+### What the role proves, every run
+
+- the proxy answers a client with the right credentials (it speaks the SOCKS5
+  handshake itself — no echo service, nothing that can be down for unrelated
+  reasons);
+- the proxy **refuses** a wrong password. An endpoint that accepts one is not
+  an endpoint, it is a relay for whoever finds the port;
+- the configuration carries no password and the password is hashed in the
+  user's database.
+
+### When something breaks
+
+```bash
+journalctl -u danted -n 50            # the proxy's own log
+cat /etc/danted.conf                   # what it was told to do
+getent shadow egress                   # the account (the hash, never the password)
+```
+
+| Symptom | What it means |
+|---|---|
+| `the endpoint refused the credentials` | the account's password is not the one you think. Force a rotation: `just socks5-deploy -e socks5_force_password_update=true` |
+| `the endpoint did not answer on …` | the proxy is not listening. Check `systemctl status danted` |
+| `cannot bind external address` | `socks5_external_address` is not an address of this host. State the address the crawler dials |
+| the crawler sees the wrong address | the endpoint's address changed. The crawler's probe learns the address on its own; the endpoint announces `external:` |
+
+### Rotating a password
+
+```bash
+just socks5-deploy -e socks5_force_password_update=true
+```
+
+The rotation is a deliberate act: a routine run does not rewrite the password,
+because rewriting a secret on every run would report a change that did not
+happen. After a rotation, update the AdsPower profile's proxy — and check that
+the crawler still sees the endpoint (its probe asks the network what address
+the world sees).
+
+### Proving it locally
+
+```bash
+just socks5-lab-test
+```
+
+The lab runs the role inside a Debian container: it installs real packages and
+writes real `/etc` files without touching the VPS. What it cannot prove is that
+the endpoint gives a *different* address than the machine it runs on — on one
+machine the proxy's exit address **is** the machine's address. That property
+belongs to the deployment, and the crawler's probe is what proves it.
+
+---
+
 ## Changing this repository
 
 Before changing anything, prove it locally — the lab suite does not touch the

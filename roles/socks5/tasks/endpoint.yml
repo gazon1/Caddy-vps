@@ -1,0 +1,151 @@
+---
+# ==============================================================================
+# The endpoint itself: the package, the account, the configuration.
+# ==============================================================================
+
+- name: Install the proxy, python (the probe speaks SOCKS5 in python) and the tools the host is asked about
+  ansible.builtin.apt:
+    name:
+      - "{{ socks5_package }}"
+      - python3
+      - ca-certificates
+      - iproute2
+    state: present
+    update_cache: true
+  become: "{{ socks5_become }}"
+
+# The account the proxy authenticates. It exists to be a name in the user's
+# database: no shell, no home, no password reuse.
+#
+# The password is NOT set here — see the task below.
+- name: Create the proxy's account
+  ansible.builtin.user:
+    name: "{{ socks5_username }}"
+    shell: /usr/sbin/nologin
+    home: /nonexistent
+    system: true
+    create_home: false
+    state: present
+  become: "{{ socks5_become }}"
+  register: socks5_account
+
+# The password is set ON THE TARGET, by chpasswd — and only when it has to be:
+# when the account was just created, or when a rotation was asked for.
+#
+# Not through the user module: the module hashes the password ON THE CONTROL
+# NODE, and a control node whose python no longer has `crypt` (3.13 removed it
+# from the standard library) stores the password AS IT IS — in cleartext, in
+# /etc/shadow. The failure is silent: the task succeeds, the secret lies in a
+# file every account on the host can read, and nothing says so.
+#
+# The password travels in a file with mode 0600 and never in a command line: a
+# command line is visible in the process list.
+- name: Write the password to a temporary file
+  ansible.builtin.copy:
+    content: "{{ socks5_username }}:{{ socks5_password }}\n"
+    dest: "{{ socks5_password_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  become: "{{ socks5_become }}"
+  no_log: true
+  when: socks5_account.changed or (socks5_force_password_update | bool)
+
+- name: Set the account's password
+  ansible.builtin.shell:
+    cmd: "chpasswd < {{ socks5_password_file }}"
+    executable: /bin/bash
+  become: "{{ socks5_become }}"
+  # The password IS changed here — that is what the task is for.
+  changed_when: true
+  no_log: true
+  when: socks5_account.changed or (socks5_force_password_update | bool)
+
+- name: Remove the temporary file with the password
+  ansible.builtin.file:
+    path: "{{ socks5_password_file }}"
+    state: absent
+  become: "{{ socks5_become }}"
+  when: socks5_account.changed or (socks5_force_password_update | bool)
+
+# The address the endpoint announces: the one the crawler dials.
+#
+# Four sources, in order of how much they are trusted:
+#
+#   1. what the operator stated — the only source that is right behind NAT;
+#   2. the host's default address, from the gathered facts;
+#   3. the first address the host has;
+#   4. what the host says when asked directly (`ip -4 -o addr show scope
+#      global`), because the facts of a minimal host do not carry the network
+#      facts at all — a container without iproute2 has none, and the facts are
+#      gathered BEFORE this role installs iproute2.
+#
+# When none of them says anything, the role stops: an endpoint that announces
+# an address nobody can dial is worse than no endpoint, because the crawler
+# would wait for a connection that never comes.
+- name: Take the announced address from the configuration
+  ansible.builtin.set_fact:
+    socks5_resolved_external_address: "{{ socks5_external_address }}"
+  when: socks5_external_address | length > 0
+
+- name: Take the announced address from the gathered facts
+  ansible.builtin.set_fact:
+    socks5_resolved_external_address: "{{ ansible_default_ipv4.address }}"
+  when:
+    - socks5_resolved_external_address | default('') | length == 0
+    - (ansible_default_ipv4 | default({})).address | default('') | length > 0
+
+- name: Take the announced address from the host's addresses
+  ansible.builtin.set_fact:
+    socks5_resolved_external_address: >-
+      {{ (ansible_all_ipv4_addresses | default([]) | first) | default('', true) }}
+  when:
+    - socks5_resolved_external_address | default('') | length == 0
+    - ansible_all_ipv4_addresses | default([]) | length > 0
+
+- name: Ask the host which address it has
+  ansible.builtin.command:
+    argv: [ip, -4, -o, addr, show, scope, global]
+  register: socks5_host_addresses
+  changed_when: false
+  failed_when: false
+  when: socks5_resolved_external_address | default('') | length == 0
+
+- name: Take the announced address from what the host said
+  ansible.builtin.set_fact:
+    socks5_resolved_external_address: >-
+      {{ (socks5_host_addresses.stdout | default('')
+          | regex_findall('inet ([0-9.]+)/') | first) | default('', true) }}
+  when: socks5_resolved_external_address | default('') | length == 0
+
+- name: Fail when the address the endpoint announces is unknown
+  ansible.builtin.fail:
+    msg: >-
+      The endpoint has to announce the address the crawler dials, and this host
+      did not say which address it has. State it:
+      -e socks5_external_address=…
+  when: socks5_resolved_external_address | default('') | length == 0
+
+# Who may use the endpoint: the crawler's addresses, and (optionally) the
+# endpoint's own loopback. The loopback is not an exposure — nothing outside
+# the host can source a connection from 127.0.0.1 — and it is what lets the
+# role verify itself after every change.
+- name: Resolve who may use the endpoint
+  ansible.builtin.set_fact:
+    socks5_allowed_cidrs: >-
+      {{ socks5_allowed_cidrs
+         + (['127.0.0.1/32'] if socks5_allow_localhost | bool else []) }}
+
+# The configuration is validated before it is put in place: `danted -V` parses
+# it and exits. A configuration that the proxy would refuse is not written, and
+# the running proxy keeps serving.
+- name: Write the proxy's configuration
+  ansible.builtin.template:
+    src: danted.conf.j2
+    dest: "{{ socks5_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "/usr/sbin/danted -V -f %s"
+  become: "{{ socks5_become }}"
+  notify: Restart the proxy

@@ -1,0 +1,51 @@
+# {{ ansible_managed }}
+#
+# The SOCKS5 endpoint of one egress group. Managed by Ansible (roles/socks5) —
+# a hand edit is lost on the next run.
+#
+# Two things keep this from being an open relay:
+#
+#   • the client rule below names the crawler's address and nobody else, so a
+#     connection from anywhere else is refused by the proxy ITSELF, not by a
+#     firewall rule that might fail open;
+#   • the client authenticates with a username and a password checked against
+#     the system's user database. There is no anonymous access.
+
+logoutput: stderr
+
+# The listener. The port is the only thing published; who may speak to it is
+# decided by the rules below.
+internal: 0.0.0.0 port = {{ socks5_port }}
+
+# The address clients are told to dial. The proxy refuses to start when it
+# cannot bind the address it was told to announce.
+external: {{ socks5_resolved_external_address }}
+
+# How the client proves who it is: a username and a password, checked against
+# the system's user database (PAM). There is no anonymous access.
+socksmethod: username
+
+# The endpoint authenticates to nothing on the way out: it connects to the
+# target as itself, anonymously.
+clientmethod: none
+
+# The account the proxy drops to for ordinary clients. Without it the proxy
+# stays root, which it says so itself.
+user.unprivileged: nobody
+
+{% for cidr in socks5_allowed_cidrs %}
+# {{ cidr }}
+#
+# The client rule decides who may connect at all; the socks rule decides what a
+# connected client may ask for. The socks rule is NOT optional: with only a
+# client rule the proxy falls back to its default block rule and refuses every
+# request, including the legitimate ones.
+client pass {
+    from: {{ cidr }} to: 0.0.0.0/0 port = {{ socks5_port }}
+    log: connect disconnect error
+}
+socks pass {
+    from: {{ cidr }} to: 0.0.0.0/0
+    log: connect disconnect error
+}
+{% endfor %}

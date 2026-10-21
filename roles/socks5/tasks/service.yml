@@ -1,0 +1,60 @@
+---
+# ==============================================================================
+# The service.
+#
+# Two ways to run it, and the difference is not a detail:
+#
+#   systemd — the host has an init that can register a service. The endpoint
+#             starts with the host and restarts when it crashes.
+#   none    — the host has no init (the lab runs the role inside a container).
+#             The proxy is a plain process. It does not survive a reboot, and
+#             the role says so instead of pretending otherwise.
+# ==============================================================================
+
+- name: Resolve how the service is run on this host
+  ansible.builtin.set_fact:
+    socks5_resolved_service_mode: >-
+      {{ socks5_service_mode if socks5_service_mode != 'auto'
+         else ('systemd' if ansible_service_mgr == 'systemd' else 'none') }}
+
+- name: Fail when systemd was demanded and the host has none
+  ansible.builtin.fail:
+    msg: >-
+      The endpoint was asked to run under systemd, and this host has
+      '{{ ansible_service_mgr }}'. Either the host is not the one you meant, or
+      the service mode should be 'none'.
+  when:
+    - socks5_resolved_service_mode == 'systemd'
+    - ansible_service_mgr != 'systemd'
+
+- name: Start the proxy and enable it at boot
+  ansible.builtin.systemd_service:
+    name: danted
+    state: started
+    enabled: true
+    daemon_reload: true
+  become: "{{ socks5_become }}"
+  when:
+    - socks5_resolved_service_mode == 'systemd'
+    - not ansible_check_mode
+
+# No init to register with: the proxy is started as a plain process. The pid
+# file is dante's own, and a running proxy is not started twice.
+- name: Start the proxy as a plain process
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f /var/run/danted.pid ] && kill -0 "$(cat /var/run/danted.pid)" 2>/dev/null; then
+        echo "already running"
+        exit 0
+      fi
+      setsid /usr/sbin/danted -f {{ socks5_config_path }} \
+        >> /var/log/danted.log 2>&1 < /dev/null &
+      sleep 1
+      echo started
+    executable: /bin/bash
+  become: "{{ socks5_become }}"
+  register: socks5_plain_start
+  changed_when: "'started' in socks5_plain_start.stdout | default(false)"
+  when:
+    - socks5_resolved_service_mode == 'none'
+    - not ansible_check_mode

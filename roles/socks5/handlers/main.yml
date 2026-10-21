@@ -1,0 +1,32 @@
+---
+# Handlers are executed in check mode as well, so these are skipped there
+# explicitly: a dry run must not restart a proxy on the host.
+
+- name: Restart the proxy
+  ansible.builtin.systemd_service:
+    name: danted
+    state: restarted
+  become: "{{ socks5_become }}"
+  when:
+    - socks5_resolved_service_mode | default('systemd') == 'systemd'
+    - not ansible_check_mode
+
+# Without an init there is nothing to restart: the process is stopped and
+# started again by hand.
+- name: Restart the proxy as a plain process
+  ansible.builtin.shell:
+    cmd: |
+      if [ -f /var/run/danted.pid ]; then
+        kill "$(cat /var/run/danted.pid)" 2>/dev/null || true
+        sleep 1
+      fi
+      setsid /usr/sbin/danted -f {{ socks5_config_path }} \
+        >> /var/log/danted.log 2>&1 < /dev/null &
+      sleep 1
+      echo restarted
+    executable: /bin/bash
+  become: "{{ socks5_become }}"
+  changed_when: true
+  when:
+    - socks5_resolved_service_mode | default('systemd') == 'none'
+    - not ansible_check_mode

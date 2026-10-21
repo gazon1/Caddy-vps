@@ -209,3 +209,35 @@ lab-test:
 wbshop-deploy *args:
     #!/usr/bin/env bash
     ansible-playbook "{{ REPO }}/playbooks/wbshop.yml" {{ args }}
+# ---- SOCKS5 ENDPOINTS ----
+# One endpoint = one egress address = one egress group of the crawler. The
+# crawler is NOT multiplied — the addresses are (see the application
+# repository's ADR 2026-11-01-one-crawler-many-addresses).
+#
+# The endpoint is reachable only from the crawler's address, and only with the
+# right password. Both are proved by the role itself: it verifies the endpoint
+# after every change and refuses to finish when the proxy answers a wrong
+# password.
+#
+# Required:
+#   SOCKS5_PASSWORD       the proxy's password (Ansible Vault also works:
+#                         -e @socks5-vault.yml, or -e socks5_password=…)
+# Required per endpoint (in the inventory's `egress` group):
+#   socks5_client_cidrs   the crawler's address, one CIDR per entry
+#
+# Usage:
+#   just socks5-deploy
+#   just socks5-deploy -e socks5_client_cidrs='["203.0.113.10/32"]'
+#   just socks5-deploy --check        # dry run
+[doc("Provision the SOCKS5 endpoints of the egress fleet")]
+socks5-deploy *args:
+    #!/usr/bin/env bash
+    ansible-playbook "{{ REPO }}/playbooks/socks5.yml" {{ args }}
+
+# ---- LOCAL VERIFICATION (socks5) ----
+# Proves the endpoint role works — installs real packages and writes real
+# /etc files inside a container, without touching the VPS.
+[doc("Prove the socks5 role locally, without touching the VPS")]
+socks5-lab-test *args:
+    #!/usr/bin/env bash
+    bash "{{ REPO }}/tests/socks5-lab.sh" {{ args }}
