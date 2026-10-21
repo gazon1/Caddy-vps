@@ -678,37 +678,79 @@ fi
 rm -f "$OUT"
 
 # ==============================================================================
-step "T11 — a registry answer that names no digest is refused, and nothing changes"
+step "T11 — the digest is read from the registry's answer, and an answer without one is refused"
 # The defect this catches: the resolution read the digest through a buildx
 # template, `--format '{{.Manifest.Digest}}'`, whose field set buildx changes
-# between versions. On the runner the request came back with the plain listing
+# between versions. On the VPS the request came back with the plain listing
 # instead of the templated field — the digest WAS in the answer, just not where
 # the template looked for it. The role read that answer as "no digest named" and
 # refused to deploy, which was the right thing to do and still stopped the
-# deploy for a day.
+# deploy.
 #
-# The registry is faked here: a `docker` earlier in PATH answers with a listing
-# that carries no `Digest:` line at all. The role must refuse THAT answer too —
-# a deploy that cannot name the image must not name it — and the refusal must
-# say which buildx answered, so that the next occurrence is diagnosable without
-# hunting through the environment.
+# The registry is faked here, because the shape of the answer is the whole
+# point: a `docker` earlier in PATH answers with a listing the way an older
+# buildx does, and everything else is delegated to the real docker.
+#
+# First case: the answer carries a `Digest:` line, in the listing form. The
+# role must take the digest from the text — that is the production shape, the
+# one that broke the deploy.
+#
+# Second case: the answer carries no `Digest:` line at all. The role must
+# refuse it — a deploy that cannot name the image must not name it — and the
+# refusal must say which buildx answered, so that the next occurrence is
+# diagnosable without hunting through the environment.
+REAL_DOCKER="$(command -v docker)"
+FAKE_DIGEST="sha256:1111111111111111111111111111111111111111111111111111111111111111"
 FAKE_BIN="$(mktemp -d)"
-cat > "$FAKE_BIN/docker" <<'FAKE'
+cat > "$FAKE_BIN/docker" <<FAKE
 #!/usr/bin/env bash
-if [ "$1" = "buildx" ] && [ "$2" = "version" ]; then
+if [ "\$1" = "buildx" ] && [ "\$2" = "version" ]; then
     echo "github.com/docker/buildx v0.0.0-lab"
     exit 0
 fi
-if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ]; then
+if [ "\$1" = "buildx" ] && [ "\$2" = "imagetools" ]; then
+    echo "Name:      lab/wb-parser:tag"
+    echo "MediaType: application/vnd.oci.image.index.v1+json"
+    echo "Digest:    ${FAKE_DIGEST}"
+    exit 0
+fi
+exec ${REAL_DOCKER} "\$@"
+FAKE
+chmod +x "$FAKE_BIN/docker"
+OUT="$(mktemp)"
+PATH="$FAKE_BIN:$PATH" play --check --diff -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1 || true
+if grep -q 'does not name a sha256' "$OUT"; then
+    fail "the role refused an answer that does name a digest"
+    tail -30 "$OUT"
+else
+    pass "the role accepted an answer that names a digest"
+fi
+if grep -q "$FAKE_DIGEST" "$OUT"; then
+    pass "the digest was taken from the text of the answer"
+else
+    fail "the digest did not come from the text of the answer"
+    tail -30 "$OUT"
+fi
+rm -f "$OUT"
+
+# The answer without a digest: the refusal.
+FAKE_BIN_NO_DIGEST="$(mktemp -d)"
+cat > "$FAKE_BIN_NO_DIGEST/docker" <<FAKE
+#!/usr/bin/env bash
+if [ "\$1" = "buildx" ] && [ "\$2" = "version" ]; then
+    echo "github.com/docker/buildx v0.0.0-lab"
+    exit 0
+fi
+if [ "\$1" = "buildx" ] && [ "\$2" = "imagetools" ]; then
     echo "Name:      lab/wb-parser:tag"
     echo "MediaType: application/vnd.oci.image.index.v1+json"
     exit 0
 fi
-exit 0
+exec ${REAL_DOCKER} "\$@"
 FAKE
-chmod +x "$FAKE_BIN/docker"
+chmod +x "$FAKE_BIN_NO_DIGEST/docker"
 OUT="$(mktemp)"
-if PATH="$FAKE_BIN:$PATH" play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1; then
+if PATH="$FAKE_BIN_NO_DIGEST:$PATH" play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1; then
     fail "the deploy succeeded even though the registry named no digest"
 else
     if grep -q 'does not name a sha256:<64 hex> digest' "$OUT"; then
@@ -736,7 +778,7 @@ else
     fi
 fi
 rm -f "$OUT"
-rm -rf "$FAKE_BIN"
+rm -rf "$FAKE_BIN" "$FAKE_BIN_NO_DIGEST"
 
 # ==============================================================================
 echo
