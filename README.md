@@ -175,6 +175,74 @@ just wbshop-deploy --tags wbshop ...
 just wbshop-deploy ... -- --check --diff
 ```
 
+## Deploying the crawler from GitHub Actions
+
+The manual way to ship the crawler is `just wbparser-deploy` with the secrets in
+the environment. That needs a machine that can reach the VPS, and it puts a key
+into a shell history. The **Deploy wb-parser** workflow does the same thing
+from a GitHub runner, which reaches the VPS, and keeps the secrets in the
+repository instead of in a shell.
+
+One dispatch does it:
+
+```bash
+gh workflow run deploy-wbparser.yml \
+  -R gazon1/Caddy-vps \
+  -f tag=<sha> \
+  -f check_only=false
+```
+
+…or use the **Actions → Deploy wb-parser → Run workflow** form.
+
+### Inputs
+
+| Input | Required | Default | What it means |
+|---|---|---|---|
+| `tag` | yes | — | tag or sha of the crawler image to deploy. The role resolves it to a digest and deploys *that* — a tag can be moved, a digest cannot |
+| `crawler_ref` | no | `main` | ref of `gazon1/wb-parser-kotlin-new` the compose file is taken from (`deploy/docker-compose.vps.yml`). The application repository owns that contract, so it is not copied here |
+| `check_only` | no | `true` | dry run: show what would change, apply nothing |
+| `status_only` | no | `false` | read-only inspection of the VPS instead of a deploy |
+
+### Repository secrets
+
+| Secret | Needed for | Meaning |
+|---|---|---|
+| `VPS_HOST`, `VPS_USER`, `VPS_PORT` | every run | where the VPS is and as whom to enter it |
+| `VPS_SSH_KEY` | every run | the private key the runner authenticates with. The host key is pinned with `ssh-keyscan`, so verification stays on |
+| `WBPARSER_CATALOG_API_KEY` | deploy | the catalog API's key. The role refuses to deploy without it, and the application refuses to start without it |
+| `WBPARSER_DB_PASSWORD` | deploy | the crawler's database password |
+| `WBPARSER_ADMIN_PASSWORD` | deploy | the admin API's password |
+| `WBPARSER_ADMIN_API_KEY` | deploy | the AdsPower Local API key — the browser runtime starts the API with it and the crawler authenticates against it with it |
+| `WBPARSER_GHCR_USER`, `WBPARSER_GHCR_TOKEN` | optional | only for a private image |
+
+The keys travel in the environment, never on a command line: the role reads
+them with `lookup('env', …)`, and a `-e key=value` would put them in the shell
+history and in the CI log. The workflow checks that they exist **before** it
+touches the VPS, so a missing secret is a one-line error instead of a failed
+deploy.
+
+`VPS_USER` must be a user that can `sudo` without a password — the deploy
+writes into `/opt`, which belongs to `root`.
+
+### What each mode does
+
+`status_only=true` runs `playbooks/status.yml` and nothing else: the container
+state, whether the running configuration is valid, which routes are installed,
+when the certificates expire. It applies nothing — the workflow skips the
+`caddy_infra` and `caddy_routes` tags, which are the parts of the role that
+re-render the base configuration and reload Caddy.
+
+`check_only=true` adds Ansible's `--check`: the playbook is evaluated, the
+changes are shown, and nothing is applied. **Known limitation:** the `wbparser`
+and `adsbrowser` roles are not written for check mode — they read the result of
+a probe that check mode skips — so the dry run stops early with an error about
+an undefined result instead of printing a complete diff. Nothing is applied
+when that happens. Use `status_only` to look at production, and treat
+`check_only=false` as the real thing.
+
+`check_only=false` is the deploy. It is a deliberate choice, made by a person
+in the dispatch form.
+
 ## Configuration
 
 Defaults live in `roles/caddy/defaults/main.yml`; anything can be overridden

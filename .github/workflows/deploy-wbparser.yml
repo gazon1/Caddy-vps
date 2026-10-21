@@ -1,0 +1,287 @@
+---
+# Выкат краулера на VPS одним диспатчем.
+#
+# Зачем этот файл существует. До сих пор выкат краулера делался только вручную
+# с машины оператора: `WBPARSER_CATALOG_API_KEY=… just wbparser-deploy`, и
+# роль брала ключ каталога из окружения (roles/wbparser/tasks/main.yml). Машина
+# оператора не всегда дотягивается до VPS, а ключ не должен попадать в историю
+# шелла. Раннер GitHub Actions до VPS достучивается, поэтому выкат переехал
+# сюда: секреты живут в репозитории, playbook делает ровно то же, что и раньше.
+#
+# Чего этот файл НЕ делает. Он ничего не выкатывает без спроса: по умолчанию
+# check_only=true — это сухой прогон Ansible, который показывает, что
+# изменится, и ничего не применяет. Реальный выкат — это явный check_only=false,
+# и это решение владельца, а не раннера.
+#
+# Требуемые секреты репозитория:
+#   VPS_HOST, VPS_USER, VPS_PORT   где живёт VPS
+#   VPS_SSH_KEY                    приватный ключ, которым раннер заходит на VPS
+#   WBPARSER_DB_PASSWORD           пароль базы краулера
+#   WBPARSER_ADMIN_PASSWORD        пароль админ-API краулера
+#   WBPARSER_ADMIN_API_KEY         ключ AdsPower Local API
+#   WBPARSER_CATALOG_API_KEY       ключ каталога (список через запятую, чтобы
+#                                  ротация ключа не оставляла дыру в сервисе)
+# Необязательные:
+#   WBPARSER_GHCR_USER, WBPARSER_GHCR_TOKEN   если образ лежит в приватном
+#                                              реестре
+name: Deploy wb-parser
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег или sha образа краулера, который разворачиваем"
+        required: true
+        type: string
+      crawler_ref:
+        description: "Реф gazon1/wb-parser-kotlin-new, из которого берётся deploy/docker-compose.vps.yml"
+        required: false
+        default: "main"
+        type: string
+      check_only:
+        description: "Сухой прогон: показать, что изменится, и ничего не применить"
+        required: false
+        default: true
+        type: boolean
+      status_only:
+        description: "Только осмотр прода (read-only), без выката"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Два выката не должны пересекаться: второй откатил бы мишень отката
+# первого. Осмотр прода живёт в своей группе, чтобы не вставать в очередь за
+# идущим выкатом.
+concurrency:
+  group: ${{ inputs.status_only && 'wbparser-status' || 'wbparser-deploy' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Файл compose принадлежит репозиторию краулера: как краулер должен
+      # работать — это его контракт, и менять его здесь нельзя. Раннер забирает
+      # ровно тот реф, который попросили, и отдаёт роли путь к файлу.
+      - name: Забрать репозиторий краулера
+        uses: actions/checkout@v7
+        with:
+          repository: gazon1/wb-parser-kotlin-new
+          ref: ${{ inputs.crawler_ref }}
+          path: crawler
+
+      - name: Проверить, что файл compose на месте
+        env:
+          CRAWLER_REF: ${{ inputs.crawler_ref }}
+        run: |
+          set -euo pipefail
+          compose="$GITHUB_WORKSPACE/crawler/deploy/docker-compose.vps.yml"
+          if [ ! -f "$compose" ]; then
+            echo "::error::В рефе $CRAWLER_REF нет deploy/docker-compose.vps.yml — выкатывать нечего."
+            exit 1
+          fi
+          echo "compose: $compose"
+
+      # Ansible ставится через pipx: на образе ubuntu-latest он уже есть, а
+      # venv в ~/.local/bin не смешивается с системным Python. `requests` нужен
+      # самой коллекции community.docker, а коллекция — самой роли wbparser.
+      # Если pipx на раннере всё-таки нет, тем же местом встаёт ansible-core
+      # из pip --user — бинарники в обоих случаях попадают в ~/.local/bin.
+      - name: Поставить Ansible и коллекции
+        run: |
+          set -euo pipefail
+          if command -v pipx >/dev/null 2>&1; then
+            pipx install ansible-core
+            pipx inject ansible-core requests
+          else
+            python3 -m pip install --user --break-system-packages ansible-core requests
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ansible-galaxy collection install -r requirements.yml
+          ansible-playbook --version
+
+      # Ключи проверяются ДО того, как раннер что-то сделает: пустой секрет
+      # выглядел бы как «сломанный playbook», и владелец потерял бы время на
+      # чтение лога вместо того, чтобы создать секрет.
+      - name: Проверить, что SSH-секреты на месте
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in VPS_HOST VPS_USER VPS_PORT VPS_SSH_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Нет секретов репозитория: ${missing[*]}."
+            echo "::error::Создать: Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      # ubuntu-latest — свежая машина на каждый прогон, поэтому known_hosts
+      # пустой. Без этого первый же ssh умирает с "Host key verification
+      # failed". Ключ здесь ОТВЕРЖАЕТСЯ, а не отключается: иначе MITM молча
+      # перехватил бы выкат.
+      - name: Довериться ключу хоста VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # ssh-agent, а не голый openssh: проверка ключа хоста остаётся включённой.
+      # v0.10.0 принимает только `ssh-private-key` — хост, пользователя и порт
+      # из его входов убрали, и передача их даёт "ssh-private-key argument is
+      # empty". Порт уезжает вместе с каждым `ssh -p`.
+      - name: Настроить SSH
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      # Отдельная проверка вместо того, чтобы ждать таймаута Ansible: так в логе
+      # видно, что именно не работает — раннер не дотягивается до VPS.
+      - name: Проверить, что раннер дотягивается до VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          ssh -p "$VPS_PORT" -o ConnectTimeout=15 -o BatchMode=yes \
+            "$VPS_USER@$VPS_HOST" "echo ok"
+
+      # Инвентарь пишется файлом, а не через -e: значения секретов не должны
+      # печататься в лог команды, а ключи инвентаря — самое место, где их видно
+      # как значения, а не как подстановки.
+      #
+      # ansible_become: true — так этот хост достигается (см.
+      # roles/caddy/tasks/routes.yml): выкат пишет в /opt, а /opt принадлежит
+      # root. Пользователь из секрета VPS_USER должен уметь sudo без пароля.
+      - name: Собрать инвентарь
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            '---' \
+            'all:' \
+            '  children:' \
+            '    vps:' \
+            '      hosts:' \
+            '        vps-1:' \
+            "          ansible_host: ${VPS_HOST}" \
+            "          ansible_user: ${VPS_USER}" \
+            "          ansible_port: ${VPS_PORT}" \
+            '          ansible_become: true' \
+            '          ansible_become_method: sudo' \
+            > "$RUNNER_TEMP/inventory.yml"
+
+      # Секреты приложения проверяются только на пути выката: осмотр прода
+      # ключ каталога не читает. Проверка идёт до Ansible, потому что роль и
+      # само приложение откажутся работать без этих ключей — а узнать об этом
+      # на середине выката дороже, чем до его начала.
+      - name: Проверить, что секреты приложения на месте
+        if: ${{ !inputs.status_only }}
+        env:
+          WBPARSER_DB_PASSWORD: ${{ secrets.WBPARSER_DB_PASSWORD }}
+          WBPARSER_ADMIN_PASSWORD: ${{ secrets.WBPARSER_ADMIN_PASSWORD }}
+          WBPARSER_ADMIN_API_KEY: ${{ secrets.WBPARSER_ADMIN_API_KEY }}
+          WBPARSER_CATALOG_API_KEY: ${{ secrets.WBPARSER_CATALOG_API_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in WBPARSER_DB_PASSWORD WBPARSER_ADMIN_PASSWORD \
+                      WBPARSER_ADMIN_API_KEY WBPARSER_CATALOG_API_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Нет секретов репозитория: ${missing[*]}."
+            echo "::error::Роль wbparser отказывается выкатывать без них, а приложение — без ключа каталога."
+            echo "::error::Создать: Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      # Осмотр прода: ничего не меняет. Теги caddy_infra и caddy_routes
+      # пропускаются намеренно — с ними роль перерисовывает базовую
+      # конфигурацию и перезагружает Caddy, а это осмотр, а не выкат.
+      # Остаются только задачи, которые читают: состояние контейнера,
+      # валидность конфигурации, список маршрутов, сроки сертификатов.
+      - name: Осмотреть прод (read-only)
+        if: ${{ inputs.status_only }}
+        run: |
+          set -euo pipefail
+          ansible-playbook playbooks/status.yml \
+            -i "$RUNNER_TEMP/inventory.yml" \
+            --skip-tags caddy_infra,caddy_routes
+
+      # Выкат. Ключ каталога едет в окружении, а не в -e: роль читает его
+      # через lookup('env', …), и в логе не должно быть ни строки с ключом,
+      # ни командной строки, в которой он засветился бы.
+      - name: Выкатить краулера
+        if: ${{ !inputs.status_only }}
+        env:
+          TAG: ${{ inputs.tag }}
+          COMPOSE_SRC: ${{ github.workspace }}/crawler/deploy/docker-compose.vps.yml
+          CHECK_ONLY: ${{ inputs.check_only }}
+          WBPARSER_DB_PASSWORD: ${{ secrets.WBPARSER_DB_PASSWORD }}
+          WBPARSER_ADMIN_PASSWORD: ${{ secrets.WBPARSER_ADMIN_PASSWORD }}
+          WBPARSER_ADMIN_API_KEY: ${{ secrets.WBPARSER_ADMIN_API_KEY }}
+          WBPARSER_CATALOG_API_KEY: ${{ secrets.WBPARSER_CATALOG_API_KEY }}
+          WBPARSER_GHCR_USER: ${{ secrets.WBPARSER_GHCR_USER }}
+          WBPARSER_GHCR_TOKEN: ${{ secrets.WBPARSER_GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$CHECK_ONLY" = "true" ]; then
+            # Сухой прогон: Ansible показывает, что изменится, и ничего не
+            # применяет. --diff показывает сами изменения файлов.
+            args+=(--check --diff)
+          fi
+          ansible-playbook playbooks/wbparser.yml \
+            -i "$RUNNER_TEMP/inventory.yml" \
+            -e "wbparser_tag=${TAG}" \
+            -e "wbparser_compose_src=${COMPOSE_SRC}" \
+            ${args[@]+"${args[@]}"}
+
+      - name: Итог
+        if: always()
+        env:
+          TAG: ${{ inputs.tag }}
+          CRAWLER_REF: ${{ inputs.crawler_ref }}
+          CHECK_ONLY: ${{ inputs.check_only }}
+          STATUS_ONLY: ${{ inputs.status_only }}
+        run: |
+          {
+            echo "### Итог"
+            echo ""
+            if [ "$STATUS_ONLY" = "true" ]; then
+              echo "- Режим: осмотр прода (read-only), ничего не применялось"
+            elif [ "$CHECK_ONLY" = "true" ]; then
+              echo "- Режим: сухой прогон (\`--check\`), ничего не применялось"
+            else
+              echo "- Режим: выкат"
+            fi
+            echo "- Образ краулера: \`${TAG}\`"
+            echo "- Файл compose взят из \`gazon1/wb-parser-kotlin-new@${CRAWLER_REF}\`"
+            echo "- Прогон: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
