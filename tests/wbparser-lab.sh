@@ -19,6 +19,7 @@
 #   T9  — a tag that cannot be resolved fails loudly and changes nothing
 #   T10 — the route is really applied: the snippet lands in the proxy's conf.d
 #         and the proxy answers through it
+#   T11 — a registry answer that names no digest is refused, and nothing changes
 #
 # The images come from a throwaway registry on localhost, not from GHCR: the
 # lab needs two images in the SAME repository, one that becomes healthy and one
@@ -675,6 +676,67 @@ else
     tail -40 "$OUT"
 fi
 rm -f "$OUT"
+
+# ==============================================================================
+step "T11 — a registry answer that names no digest is refused, and nothing changes"
+# The defect this catches: the resolution read the digest through a buildx
+# template, `--format '{{.Manifest.Digest}}'`, whose field set buildx changes
+# between versions. On the runner the request came back with the plain listing
+# instead of the templated field — the digest WAS in the answer, just not where
+# the template looked for it. The role read that answer as "no digest named" and
+# refused to deploy, which was the right thing to do and still stopped the
+# deploy for a day.
+#
+# The registry is faked here: a `docker` earlier in PATH answers with a listing
+# that carries no `Digest:` line at all. The role must refuse THAT answer too —
+# a deploy that cannot name the image must not name it — and the refusal must
+# say which buildx answered, so that the next occurrence is diagnosable without
+# hunting through the environment.
+FAKE_BIN="$(mktemp -d)"
+cat > "$FAKE_BIN/docker" <<'FAKE'
+#!/usr/bin/env bash
+if [ "$1" = "buildx" ] && [ "$2" = "version" ]; then
+    echo "github.com/docker/buildx v0.0.0-lab"
+    exit 0
+fi
+if [ "$1" = "buildx" ] && [ "$2" = "imagetools" ]; then
+    echo "Name:      lab/wb-parser:tag"
+    echo "MediaType: application/vnd.oci.image.index.v1+json"
+    exit 0
+fi
+exit 0
+FAKE
+chmod +x "$FAKE_BIN/docker"
+OUT="$(mktemp)"
+if PATH="$FAKE_BIN:$PATH" play -e "wbparser_tag=$LAB_TAG_GOOD" > "$OUT" 2>&1; then
+    fail "the deploy succeeded even though the registry named no digest"
+else
+    if grep -q 'does not name a sha256:<64 hex> digest' "$OUT"; then
+        pass "the failure says the answer names no digest"
+    else
+        fail "the failure does not say the answer names no digest"
+        tail -30 "$OUT"
+    fi
+    if grep -q 'v0.0.0-lab' "$OUT"; then
+        pass "the failure names the buildx that answered"
+    else
+        fail "the failure does not name the buildx that answered"
+    fi
+    ENV_DIGEST="$(grep '^DIGEST=' "$LAB_BASE/.env" | cut -d= -f2 | tr -d '[:space:]')"
+    if [[ "$ENV_DIGEST" == "$GOOD_DIGEST" ]]; then
+        pass ".env still holds the previous digest"
+    else
+        fail ".env holds '$ENV_DIGEST', expected the previous digest '$GOOD_DIGEST'"
+    fi
+    DEPLOYED="$(tr -d '[:space:]' < "$LAB_BASE/.deployed-digest" 2>/dev/null || true)"
+    if [[ "$DEPLOYED" == "$GOOD_DIGEST" ]]; then
+        pass "the state file still holds the previous digest"
+    else
+        fail "the state file holds '$DEPLOYED', expected '$GOOD_DIGEST'"
+    fi
+fi
+rm -f "$OUT"
+rm -rf "$FAKE_BIN"
 
 # ==============================================================================
 echo
