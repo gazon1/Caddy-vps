@@ -79,6 +79,16 @@ caddy_route_content: ""
 # do with the route being correct.
 caddy_route_url: ""
 caddy_route_timeout: 10
+# How long the probe waits for an answer that is not there yet.
+#
+# The first apply of a route races the certificate: Caddy issues it in the
+# background after a reload, and until the certificate exists the TLS
+# handshake does not complete. That is a normal state for a first deploy, not
+# a broken route, so the probe waits instead of failing on the first try.
+# 20 attempts with a 5-second pause — a window of about 100 seconds, which is
+# comfortably longer than certificate issuance takes.
+caddy_route_retries: 20
+caddy_route_delay: 5
 # Needed when probing a self-signed certificate (a snippet using `tls internal`).
 caddy_route_insecure: false
 # Optional curl --resolve value, e.g. "myproject.test:443:127.0.0.1", for when

@@ -109,7 +109,6 @@
             owner: "{{ caddy_owner }}"
             group: "{{ caddy_group }}"
             mode: "0644"
-          notify: Reload Caddy
 
         - name: Validate the configuration with the new snippet in place
           ansible.builtin.command:
@@ -127,6 +126,33 @@
           # показывает diff), и валидировать было бы СТАРУЮ конфигурацию —
           # она ничего не говорит о новом сниппете. Поэтому проверка в dry run
           # пропускается явно, а не делает вид, что конфигурация проверена.
+          when: not ansible_check_mode
+
+        # The proxy must serve the new configuration BEFORE the probe asks it
+        # about the route.
+        #
+        # A reload in a handler happens at the END of the play — after the
+        # probe, which is an ordinary task. The probe therefore asked the proxy
+        # about the OLD configuration, and a route that had never been served
+        # looked exactly like a route that does not work. That is what made the
+        # first apply of a route fail: the snippet was written, the
+        # configuration was valid, and the proxy simply had not been reloaded
+        # yet.
+        #
+        # The reload is explicit here for that reason, and the handler is not
+        # notified any more: the proxy is reloaded once, at the point where the
+        # new configuration is known to be good.
+        - name: Reload the proxy with the new configuration
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ caddy_container }}"
+              - caddy
+              - reload
+              - --config
+              - /etc/caddy/Caddyfile
+          changed_when: true
           when: not ansible_check_mode
 
       rescue:
@@ -149,6 +175,23 @@
             path: "{{ caddy_conf_d }}/{{ caddy_route_name }}.caddy"
             state: absent
           when: not caddy_snippet_current.stat.exists
+
+        # The file on disk is restored, but the running proxy still serves the
+        # configuration it was given last. Without this reload the rollback
+        # would be a rollback on disk only, and the broken route would keep
+        # answering.
+        - name: Reload the proxy after the rollback
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ caddy_container }}"
+              - caddy
+              - reload
+              - --config
+              - /etc/caddy/Caddyfile
+          changed_when: true
+          when: not ansible_check_mode
 
         - name: Re-validate after the rollback to tell the two failure cases apart
           ansible.builtin.command:
@@ -239,6 +282,26 @@
       when:
         - not ansible_check_mode
         - caddy_route_url | length > 0
+      # Проба повторяется, потому что у первого выката есть гонка, и гонка
+      # нормальная: Caddy выпускает сертификат для адреса В ФОНЕ после
+      # reload, а проба спрашивает маршрут сразу. До появления сертификата
+      # рукопожатие не проходит, и проба получала «не ответил» там, где всё
+      # наоборот — маршрут применён, сертификат ещё выпускается.
+      #
+      # Ждать имеет смысл только на таких отказах:
+      #   7   — соединение отклонено: reload ещё не прошёл (секунды)
+      #   35  — SSL connect error: сертификата ещё нет
+      #   51, 58 — рукопожатие не сложилось
+      #   60  — сертификат не прошёл проверку: он ещё не выпущен
+      # Любой другой отказ — ответ получен, и ждать нечего: приложение
+      # ответило (rc 0) или упало по существу.
+      until: >-
+        (caddy_route_probe.rc | default(1) | int) == 0 or
+        (caddy_route_probe.rc | default(1) | int) not in caddy_route_wait_codes
+      retries: "{{ caddy_route_retries | default(20) }}"
+      delay: "{{ caddy_route_delay | default(5) }}"
+      vars:
+        caddy_route_wait_codes: [7, 35, 51, 58, 60]
 
     # 2xx/3xx/4xx all mean the application answered, so routing works. curl
     # prints 000 when it never got a response at all — a dead TLS handshake, a
@@ -246,15 +309,41 @@
     - name: Work out whether the route answered
       ansible.builtin.set_fact:
         caddy_route_status: "{{ caddy_route_probe.stdout | default('000') | trim }}"
+        caddy_route_attempts: "{{ caddy_route_probe.attempts | default(1) }}"
       when:
         - not ansible_check_mode
         - caddy_route_url | length > 0
+
+    # Отказ по TLS — это не «маршрут не применён», а «сертификат ещё
+    # выпускается». Разница видна пользователю: в первом случае маршрута нет
+    # и надо чинить конфигурацию, во втором всё уже применено и надо просто
+    # подождать. Сообщение говорит именно это.
+    - name: Report a route whose certificate is not ready yet
+      ansible.builtin.fail:
+        msg: >-
+          The route was applied and the configuration validates, but
+          {{ caddy_route_url }} did not answer — the certificate for this
+          address is not ready: after
+          {{ caddy_route_attempts | default(1) }} attempts the TLS handshake
+          still fails
+          {{ '(' + probe_detail + ')' if probe_detail | default('') | length > 0 else '' }}.
+          Caddy issues a certificate in the background after a reload, so the
+          first apply of a route always races that issuance — this is a normal
+          state, not a broken route. Wait a minute and re-run the deploy, or
+          check Caddy's own log for the issuance attempt
+          ({{ caddy_container }}: docker logs {{ caddy_container }}).
+          The snippet has NOT been rolled back.
+      when:
+        - not ansible_check_mode
+        - caddy_route_url | length > 0
+        - (caddy_route_probe.rc | default(1) | int) in [35, 51, 58, 60]
 
     - name: Report an unreachable route
       ansible.builtin.fail:
         msg: >-
           The configuration was applied and validates, but {{ caddy_route_url }}
-          did not answer — HTTP {{ caddy_route_status }}
+          did not answer — HTTP {{ caddy_route_status }} after
+          {{ caddy_route_attempts | default(1) }} attempts
           {{ '(' + probe_detail + ')' if probe_detail | default('') | length > 0 else '' }}.
           Caddy cannot load a broken configuration, but it will happily forward
           to an upstream that does not exist — that is the one class of mistake
@@ -271,4 +360,10 @@
         # check mode не было.
         - not ansible_check_mode
         - caddy_route_url | length > 0
-        - caddy_route_status | int < 200 or caddy_route_status | int >= 500
+        # Два разных случая: curl вообще не получил ответа (rc != 0 — кроме
+        # случая «сертификат ещё выпускается», который отделён выше) или
+        # приложение ответило ошибкой сервера (5xx). Ответ 2xx/3xx/4xx
+        # означает, что маршрут работает: отвечает приложение.
+        - >-
+          (caddy_route_probe.rc | default(1) | int) != 0 or
+          (caddy_route_status | int) >= 500
