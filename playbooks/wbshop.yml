@@ -17,10 +17,14 @@
 #   wbparser_tag             — Docker image tag for parser
 #   wbshop_tag               — Docker image tag for wbshop
 #   WBPARSER_COMPOSE_SRC    — path to parser's deploy/docker-compose.vps.yml
-#   WBSHOP_COMPOSE_SRC      — path to wbshop's docker-compose.yml (optional, uses app.env)
+#   WBSHOP_COMPOSE_SRC      — path to wbshop's docker-compose.yml
+#   WBSHOP_ROUTE_SRC        — path to wbshop's deploy/caddy.conf.caddy
+#                              (the site's own route file; the address and the
+#                              public URL are read out of it)
 #   WBPARSER_DB_PASSWORD    — database password
 #   WBPARSER_ADMIN_PASSWORD — admin password
 #   WBPARSER_ADMIN_API_KEY  — admin API key (used for adsbrowser when adspower_enabled=true)
+#   WBPARSER_CATALOG_API_KEY — the key the site reads the catalog with
 #
 # Optional variables:
 #   adspower_enabled         — set false to skip adsbrowser (default: true)
@@ -234,21 +238,27 @@
     # Container
     wbshop_container_name: "product-catalog"
 
-    # Database (shared, read from crawler)
-    # These match the wbparser role defaults since wbshop reads the same DB
-    wbshop_db_host: "91.188.212.209"
-    wbshop_db_port: "5432"
-    wbshop_db_name: "wbparser"
-    wbshop_db_user: "catalog"
-    wbshop_db_password: "{{ lookup('env', 'WBPARSER_DB_PASSWORD') }}"
-
     # Health gate
     wbshop_health_timeout: 180
     wbshop_health_retries: 20
     wbshop_health_delay: 6
 
+    # The site's route file — the storefront's own. The address and the public
+    # URL are read out of it, so there is one place where the domain is
+    # written down: the file the storefront's CI checksums against the server.
+    wbshop_route_src: >-
+      {{ lookup('env', 'WBSHOP_ROUTE_SRC') | default('', true) }}
+    wbshop_route_address: >-
+      {{ (lookup('ansible.builtin.file', wbshop_route_src, errors='ignore')
+          | regex_search('(?m)^([^#\s][^\n{]*?)\s*\{', '\\1')
+          | default('', true)).split(',')[0].strip() }}
+
     # Site URL (for canonical URLs, sitemap, etc.)
-    wbshop_site_url: "https://wb-parser.maxdrobin.ru"
+    #
+    # ТОТ ЖЕ адрес, что в маршруте витрины, — он и берётся из маршрута.
+    # Расхождение между ними даёт sitemap, полный ссылок в никуда, и
+    # канонические теги, которые уводят посетителя не туда.
+    wbshop_site_url: "https://{{ wbshop_route_address }}"
 
     # Ownership
     wbshop_owner: root
@@ -256,7 +266,12 @@
 
     # Caddy route
     wbshop_route_name: "product-catalog"
-    wbshop_hostname: "wb-parser.maxdrobin.ru"
+
+    # The key the site reads the catalog with. The same value the crawler's
+    # catalog API is configured with — the crawler accepts a list, so a
+    # rotation can add the new key there first and switch the site over
+    # afterwards.
+    wbshop_catalog_api_key: "{{ lookup('env', 'WBPARSER_CATALOG_API_KEY') | default('', true) }}"
 
   tasks:
     - name: Validate wbshop_tag is set
@@ -310,35 +325,40 @@
         mode: "0644"
       when: wbshop_compose_src | length > 0
 
-    - name: Render .env with TAG and IMAGE_OWNER
-      ansible.builtin.copy:
-        dest: "{{ wbshop_env_file }}"
-        content: |
+    # The site's own compose reads `.env` and nothing else: `env_file: .env`.
+    # The public URL and the catalog's address and key belong there, because
+    # a variable in a file the compose does not read is a variable the site
+    # never sees — and the site answers 503 without a key, and ships a sitemap
+    # of localhost links without a URL.
+    #
+    # The content is assembled once and used twice: the rollback below
+    # re-renders the same file, and a rollback that dropped the key would
+    # bring back a site that cannot read the catalog.
+    - name: Compose the site's environment
+      ansible.builtin.set_fact:
+        wbshop_env_content: |
           TAG={{ wbshop_tag }}
           IMAGE_OWNER={{ wbshop_image_owner }}
-        owner: "{{ wbshop_owner }}"
-        group: "{{ wbshop_group }}"
-        mode: "0644"
-
-    # The URL is assembled here rather than in the template below: written out
-    # in one line it is longer than a line is allowed to be, and a folded
-    # scalar inside the file's contents would put a newline into the URL.
-    - name: Compose the database URL
-      ansible.builtin.set_fact:
-        wbshop_db_authority: "{{ wbshop_db_user }}:{{ wbshop_db_password }}@{{ wbshop_db_host }}:{{ wbshop_db_port }}"
-        wbshop_database_url: "postgresql://{{ wbshop_db_authority }}/{{ wbshop_db_name }}?sslmode=require"
+          NEXT_PUBLIC_SITE_URL={{ wbshop_site_url }}
+          CRAWLER_API_URL=http://wb-parser:8080
+          CRAWLER_API_KEY={{ wbshop_catalog_api_key }}
       no_log: true
 
-    - name: Render app.env with DATABASE_URL
+    - name: Render .env with the tag, the address and the key
       ansible.builtin.copy:
-        dest: "{{ wbshop_app_env_file }}"
-        content: |
-          DATABASE_URL={{ wbshop_database_url }}
-          NEXT_PUBLIC_SITE_URL={{ wbshop_site_url }}
+        dest: "{{ wbshop_env_file }}"
+        content: "{{ wbshop_env_content }}"
         owner: "{{ wbshop_owner }}"
         group: "{{ wbshop_group }}"
         mode: "0600"
-      no_log: true
+
+    # The file `app.env` used to be written here is gone, and that is a fix,
+    # not a loss: the site's compose reads `.env` and nothing else, so the
+    # site never saw the variables that were in `app.env`. Among them was
+    # NEXT_PUBLIC_SITE_URL — the site shipped a sitemap full of localhost
+    # links — and DATABASE_URL, which the site no longer needs at all: it
+    # reads the catalog over HTTP, under a key, and does not connect to
+    # PostgreSQL.
 
     - name: Pull and start wbshop
       block:
@@ -389,15 +409,17 @@
               {{ _wbshop_failed_logs.stderr }}
           when: wbshop_previous_tag | length == 0
 
+        # Тот же файл и те же ключи — только с предыдущим тегом. Откат, который
+        # переписал бы .env двумя строками, оставил бы сайт без ключа
+        # каталога: контейнер поднялся, а читать каталог он не может.
         - name: Restore previous tag
           ansible.builtin.copy:
             dest: "{{ wbshop_env_file }}"
-            content: |
-              TAG={{ wbshop_previous_tag }}
-              IMAGE_OWNER={{ wbshop_image_owner }}
+            content: "{{ wbshop_env_content | replace('TAG=' ~ wbshop_tag, 'TAG=' ~ wbshop_previous_tag) }}"
             owner: "{{ wbshop_owner }}"
             group: "{{ wbshop_group }}"
-            mode: "0644"
+            mode: "0600"
+          no_log: true
 
         - name: Restart with previous tag
           community.docker.docker_compose_v2:
@@ -422,7 +444,8 @@
       ansible.builtin.debug:
         msg:
           - "Image: {{ wbshop_registry }}/{{ wbshop_image_owner }}/{{ wbshop_image_name }}:{{ wbshop_tag }}"
-          - "Database: {{ wbshop_db_host }}:{{ wbshop_db_port }}/{{ wbshop_db_name }}"
+          - "Site URL: {{ wbshop_site_url }}"
+          - "Catalog: the crawler's HTTP API, not a database — the site does not connect to PostgreSQL"
           - "Rollback target: {{ wbshop_previous_tag }}"
 
 - name: Apply Caddy route for wbshop
@@ -435,39 +458,46 @@
     - "{{ playbook_dir }}/../roles/caddy/defaults/main.yml"
 
   vars:
-    caddy_route_name: "{{ wbshop_route_name | default('product-catalog') }}"
-    wbshop_hostname: "{{ wbshop_hostname | default('wb-parser.maxdrobin.ru') }}"
+    # The route is not written here. It is the storefront's own file
+    # (deploy/caddy.conf.caddy in gazon1/product-catalog), and the storefront's
+    # CI compares the copy on the server with that file by checksum. A second
+    # copy of the same route in this repository would drift from it without
+    # anyone noticing — and the checksum gate would catch the drift only after
+    # the site had already been deployed with the wrong address.
+    wbshop_route_src: >-
+      {{ lookup('env', 'WBSHOP_ROUTE_SRC') | default('', true) }}
 
   tasks:
-    - name: Render wbshop Caddy snippet
-      ansible.builtin.set_fact:
-        caddy_route_content: |
-          {{ wbshop_hostname }} {
-              encode gzip zstd
+    - name: Require the site's route file
+      ansible.builtin.assert:
+        that:
+          - wbshop_route_src | length > 0
+        fail_msg: >-
+          WBSHOP_ROUTE_SRC is not set. The site's route is the storefront's own
+          file — deploy/caddy.conf.caddy in gazon1/product-catalog — and not a
+          copy written in this repository. Point WBSHOP_ROUTE_SRC at that file.
 
-              reverse_proxy product-catalog:3000 {
-                  header_up Host {host}
-                  header_up X-Real-IP {remote_host}
-                  flush_interval -1
-              }
-
-              header {
-                  X-Content-Type-Options "nosniff"
-                  Referrer-Policy "strict-origin-when-cross-origin"
-                  X-Frame-Options "DENY"
-                  Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
-              }
-
-              log {
-                  output stdout
-                  format console
-              }
-          }
-      when: wbshop_hostname | length > 0
-
+    # Имя и источник маршрута задаются ЗДЕСЬ, на уровне задачи, а не в vars
+    # плейбука. Причина — приоритет переменных в Ansible:
+    #
+    #   extra vars (-e) > vars задачи > vars блока > vars роли >
+    #   include_vars > set_fact > vars плейбука > vars_files плейбука >
+    #   умолчания роли
+    #
+    # vars_files этого плейбука подключает умолчания роли caddy, где
+    # caddy_route_name: "" — «маршрута нет». Умолчания из vars_files
+    # перебивают vars плейбука, поэтому объявленное там имя до routes.yml НЕ
+    # доходило: первый блок routes.yml начинается с
+    # `when: caddy_route_name | length > 0`, и при пустом имени весь блок
+    # пропускался. Маршрут не появлялся на сервере, а выкат выглядел
+    # успешным — контейнер поднялся, а пути к нему не было.
+    # С маршрутом краулера было ровно то же, и починено в #16.
     - name: Apply the route
       ansible.builtin.import_tasks: "{{ playbook_dir }}/../roles/caddy/tasks/routes.yml"
-      when: wbshop_hostname | length > 0
+      vars:
+        caddy_route_name: "{{ wbshop_route_name }}"
+        caddy_route_src: "{{ wbshop_route_src }}"
+      when: wbshop_route_src | length > 0
 
   handlers:
     - name: Reload Caddy

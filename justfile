@@ -200,6 +200,9 @@ lab-test:
 #   WBPARSER_ADMIN_API_KEY     the X-Api-Key for admin endpoints
 #   WBPARSER_COMPOSE_SRC       path to deploy/docker-compose.vps.yml in the parser checkout
 #   WBSHOP_COMPOSE_SRC         path to docker-compose.yml in the wbshop checkout
+#   WBSHOP_ROUTE_SRC           path to deploy/caddy.conf.caddy in the wbshop
+#                              checkout — the site's own route file, and the
+#                              only place the site's address is written down
 #
 # Usage:
 #   just wbshop-deploy -e wbparser_tag=<sha> -e wbshop_tag=<sha>

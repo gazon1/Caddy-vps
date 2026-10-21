@@ -1,0 +1,113 @@
+---
+# The addresses the route snippets claim.
+#
+# Two snippets that claim the same address do not "work out": Caddy merges two
+# site blocks with the same name, and the two of them both have a catch-all,
+# so which upstream answers a given path depends on the order the files happen
+# to be merged in. That is not a configuration — it is a coin toss that changes
+# when an unrelated file is added.
+#
+# So the rule is checked, not documented: a snippet may not claim an address
+# that another installed snippet already claims. The check reads the OTHER
+# snippets on the host, because that is where the conflict actually lives —
+# the repository knows only its own file.
+#
+# The address of a snippet is the SITE block it opens: the text before the
+# first `{` on a line that ends with one, at the top level of the file. A
+# block may name several addresses, separated by commas.
+#
+# Only the top level: a nested block — `log {`, `handle {`, `header {` — is
+# indented, and it is not an address. Reading it as one made the check refuse
+# a route that claimed no address at all, because the other snippet also had
+# a `log` block.
+#
+# The snippet being applied is not among "the others": it is the file this run
+# overwrites, and comparing it with itself would report a conflict every time.
+
+- name: The text of the snippet that is about to be applied
+  ansible.builtin.set_fact:
+    caddy_new_snippet_text: >-
+      {{ caddy_route_content if (caddy_route_content | default('') | length > 0)
+         else (lookup('ansible.builtin.file', caddy_route_src, errors='ignore')) }}
+
+- name: The other snippets installed on this host
+  ansible.builtin.find:
+    paths: "{{ caddy_conf_d }}"
+    patterns: "*.caddy"
+  register: caddy_installed_snippets
+
+- name: Read the other snippets
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop: >-
+    {{ (caddy_installed_snippets.files | default([]))
+       | map(attribute='path') | list
+       | reject('equalto', caddy_conf_d ~ '/' ~ caddy_route_name ~ '.caddy') | list }}
+  register: caddy_installed_snippet_bodies
+
+- name: The addresses each installed snippet claims
+  ansible.builtin.set_fact:
+    caddy_snippet_claims: >-
+      {%- set out = [] -%}
+      {%- for item in (caddy_installed_snippet_bodies | default({})).get('results', []) -%}
+      {%-   set addrs = [] -%}
+      {%-   for line in (item.content | default('') | b64decode).split('\n') -%}
+      {%-     if line == line.lstrip() and line.strip().endswith('{') and not line.strip().startswith('#') -%}
+      {%-       for addr in line.strip()[:-1].split(',') -%}
+      {%-         if addr.strip() | length > 0 -%}
+      {%-           set _ = addrs.append(addr.strip().lower()) -%}
+      {%-         endif -%}
+      {%-       endfor -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   set _ = out.append({'file': item.source | default(''), 'addresses': addrs}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: The address the new snippet claims
+  ansible.builtin.set_fact:
+    caddy_new_addresses: >-
+      {%- set out = [] -%}
+      {%- for line in (caddy_new_snippet_text | default('') | string).split('\n') -%}
+      {%-   if line == line.lstrip() and line.strip().endswith('{') and not line.strip().startswith('#') -%}
+      {%-     for addr in line.strip()[:-1].split(',') -%}
+      {%-       if addr.strip() | length > 0 -%}
+      {%-         set _ = out.append(addr.strip().lower()) -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: The addresses that are already taken
+  ansible.builtin.set_fact:
+    caddy_conflict_addresses: >-
+      {{ caddy_new_addresses | default([])
+         | intersect(caddy_snippet_claims | default([])
+           | map(attribute='addresses') | flatten) }}
+
+- name: The files that already claim them
+  ansible.builtin.set_fact:
+    caddy_conflict_files: >-
+      {%- set out = [] -%}
+      {%- for claim in caddy_snippet_claims | default([]) -%}
+      {%-   if claim.addresses | intersect(caddy_conflict_addresses | default([])) | length > 0 -%}
+      {%-     set _ = out.append(claim.file) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: Refuse a second route for an address that is already taken
+  ansible.builtin.fail:
+    msg: >-
+      The address {{ caddy_conflict_addresses | join(', ') }} is already claimed
+      by {{ caddy_conflict_files | join(', ') }} in {{ caddy_conf_d }}, and this
+      snippet claims it too. Two routes for one address do not compose: Caddy
+      merges two site blocks with the same name, and with two catch-alls the
+      upstream that answers a path depends on the order the files happen to be
+      merged in.
+      {{ '\n' }}
+      Give one of the two routes its own address — that is a decision about
+      what a visitor types, so it is the owner's — and apply the other one
+      first. Nothing was written.
+  when: (caddy_conflict_addresses | default([]) | length) > 0
