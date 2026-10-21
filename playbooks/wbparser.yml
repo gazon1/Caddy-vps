@@ -151,7 +151,13 @@
       delay: 10
       until: _wbparser_catalog_probe.stdout | trim == '200'
       no_log: true
-      when: wbparser_hostname | length > 0
+      when:
+        # В check mode команда не выполняется — ответа каталога нет, и читать
+        # нечего. Проба описывает маршрут прямо сейчас, а сухой прогон не
+        # должен на нём падать: каталог может начать отвечать именно этим
+        # выкатом.
+        - not ansible_check_mode
+        - wbparser_hostname | length > 0
       tags: [caddy_routes]
 
     - name: Report what the catalog answered
@@ -163,6 +169,8 @@
           401 means the key this deploy carries is not the one the application
           accepted; a 000 means the request never arrived.
       when:
+        # Первым — результата пробы в check mode нет, и читать его нечего.
+        - not ansible_check_mode
         - wbparser_hostname | length > 0
         - _wbparser_catalog_probe.stdout | trim != '200'
       tags: [caddy_routes]
@@ -192,3 +200,6 @@
           - --config
           - /etc/caddy/Caddyfile
       changed_when: true
+      # В check mode перезагрузки не будет: сухой прогон показывает diff
+      # конфигурации, а не её применение.
+      when: not ansible_check_mode

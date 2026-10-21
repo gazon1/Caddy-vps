@@ -1,6 +1,13 @@
 ---
 # ==============================================================================
 # Handlers for the adsbrowser_api role.
+#
+# Handlers are executed in check mode as well — Ansible does not skip them
+# there — so a handler that restarts a service would really restart it, and on
+# a host where the unit does not exist yet (the unit file is only written by
+# the deploy, and a dry run writes nothing) the systemd module would fail with
+# "service not found". That is why every handler here is skipped explicitly
+# in check mode: a dry run restarts nothing.
 # ==============================================================================
 
 - name: Restart adsbrowser-api
@@ -8,12 +15,19 @@
     name: "{{ adsbrowser_api_service_name }}"
     state: restarted
     daemon_reload: true
+  # В check mode сервис не перезапускается: сухой прогон ничего не делает с
+  # работающими сервисами.
+  when: not ansible_check_mode
 
 - name: Reload systemd
   ansible.builtin.systemd:
     daemon_reload: true
+  # В check mode перечитывать демон нечего: юнит-файл не был записан.
+  when: not ansible_check_mode
 
 - name: Reload adsbrowser-api
   ansible.builtin.systemd:
     name: "{{ adsbrowser_api_service_name }}"
     state: reloaded
+  # Как и выше: в check mode перезагрузки не происходит.
+  when: not ansible_check_mode

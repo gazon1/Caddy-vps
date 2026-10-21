@@ -170,6 +170,10 @@
   changed_when: false
   failed_when: _wbparser_dns.rc != 0
   ignore_errors: true
+  # В check mode команда не выполняется — результата нет, и читать нечего.
+  # DNS хоста к тому же ничего не говорит о том, ЧТО изменится: сухой прогон
+  # не должен падать из-за того, что прямо сейчас имя резолвится плохо.
+  when: not ansible_check_mode
 
 - name: Fail early when the registry cannot be resolved
   ansible.builtin.fail:
@@ -177,7 +181,9 @@
       {{ wbparser_registry }} does not resolve on this host
       (getent exit {{ _wbparser_dns.rc }}). The container cannot be pulled
       without it — check DNS before anything else.
-  when: _wbparser_dns.rc != 0
+  when:
+    - not ansible_check_mode
+    - (_wbparser_dns.rc | default(1)) != 0
 
 # ── Registry access ──────────────────────────────────────────────────────────
 # Only for a private package. An empty token is not an error: a public package,
@@ -196,6 +202,9 @@
     stdin: "{{ wbparser_registry_token }}"
   no_log: true
   when:
+    # В check mode логин не выполняется: сухой прогон не меняет учётные
+    # данные docker на хосте. Результата у команды нет, и читать нечего.
+    - not ansible_check_mode
     - wbparser_registry_user | length > 0
     - wbparser_registry_token | length > 0
   changed_when: true
@@ -376,6 +385,12 @@
         wait: true
         wait_timeout: "{{ wbparser_health_timeout }}"
       register: _wbparser_up
+      # В check mode compose не запускается. Две причины, и обе настоящие:
+      # сухой прогон не должен поднимать контейнеры, и compose читает .env и
+      # browser.env — а эти файлы в check mode не записаны, только показаны
+      # в diff. На хосте, где их ещё нет, compose упал бы с «файл не найден».
+      # Что изменится, показывает diff файлов ниже.
+      when: not ansible_check_mode
 
     # `wait` above already honours the container healthcheck. This repeats the
     # check so a failure arrives as a sentence about health rather than as
@@ -390,6 +405,10 @@
         .get('Status', 'none') == 'healthy'
       retries: "{{ wbparser_health_retries }}"
       delay: "{{ wbparser_health_delay }}"
+      # Проба, а не проверка результата: в check mode контейнер не
+      # перезапускался, его healthcheck ничего не говорит о том, что будет
+      # после выката, а сам `docker inspect` не выполняется и результата нет.
+      when: not ansible_check_mode
 
     # The browser runtime has to be RUNNING, not healthy: a crawler that comes
     # up healthy with no browser beside it is a crawler that fails every fetch
@@ -409,6 +428,9 @@
       until: _wbparser_browser_inspect.stdout | trim == 'true'
       retries: "{{ wbparser_browser_health_retries }}"
       delay: "{{ wbparser_browser_health_delay }}"
+      # Проба, как и предыдущая: в check mode контейнер не трогали, а команды
+      # не выполняются — результата, который можно прочитать, нет.
+      when: not ansible_check_mode
 
     - name: Record the digest that is now running
       ansible.builtin.copy:
@@ -446,6 +468,9 @@
       register: _wbparser_failed_logs
       changed_when: false
       failed_when: false
+      # В check mode команда не выполняется — логи читать нечего, а контейнер
+      # в dry run всё равно не трогали.
+      when: not ansible_check_mode
 
     # The browser runtime's own last words, when there is one. A crawler that
     # came up healthy and a browser that did not start is a different failure
@@ -456,6 +481,8 @@
       register: _wbparser_browser_failed_logs
       changed_when: false
       failed_when: false
+      # Как и выше: в check mode команда не выполняется.
+      when: not ansible_check_mode
 
     # Nothing to go back to on a first deploy. Reported before the rollback
     # steps, which would otherwise re-render an empty digest and start nothing.
@@ -473,7 +500,9 @@
           {{ '\n\nBrowser runtime logs:\n' }}
           {{ (_wbparser_browser_failed_logs.stdout | default('')) }}
           {{ (_wbparser_browser_failed_logs.stderr | default('')) }}
-      when: wbparser_previous_digest | length == 0
+      when:
+        - not ansible_check_mode
+        - wbparser_previous_digest | length == 0
 
     # The browser runtime rolls back to its own previous digest. When there is
     # none — the first deploy that adds the browser to a host that already ran
@@ -497,6 +526,9 @@
       vars:
         wbparser_env_digest: "{{ wbparser_rollback_digest }}"
         wbparser_env_browser_digest: "{{ wbparser_rollback_browser_digest }}"
+      # Откат — это изменение хоста. В check mode ничего не применялось, и
+      # откатывать нечего: файл остаётся таким, каким был.
+      when: not ansible_check_mode
 
     # After the .env above, never before: compose reads the digest out of that
     # file, so starting the container first would re-run the image that just
@@ -513,13 +545,20 @@
       vars:
         wbparser_env_digest: "{{ wbparser_rollback_digest }}"
         wbparser_env_browser_digest: "{{ wbparser_rollback_browser_digest }}"
+      # Как и выше: поднимать контейнеры сухой прогон не станет.
+      when: not ansible_check_mode
 
     - name: Fail with what happened and what was done about it
       ansible.builtin.fail:
         msg: >-
           {{ wbparser_image_ref }}@{{ wbparser_digest }} (the image named by the
           tag {{ wbparser_tag }}) did not come up within
-          {{ wbparser_health_timeout }}s. Rolled back to
+          {{ wbparser_health_timeout }}s.
+          {% if ansible_check_mode %}
+          This was a dry run: nothing was applied, so there was nothing to roll
+          back — the diff above is what the deploy would change.
+          {% else %}
+          Rolled back to
           {{ wbparser_image_ref }}@{{ wbparser_rollback_digest }}, which is what
           is running now.
           {% if wbparser_previous_browser_digest | length > 0 %}
@@ -530,6 +569,7 @@
           {{ wbparser_browser_image_ref }}@{{ wbparser_browser_digest }}: there was
           no browser runtime running before this deploy, so there is nothing to
           roll it back to.
+          {% endif %}
           {% endif %}
           {{ '\n\nContainer logs:\n' }}
           {{ (_wbparser_failed_logs.stdout | default('')) }}
@@ -557,3 +597,12 @@
         Browser rollback target:
         {{ wbparser_browser_image_ref }}@{{ (wbparser_previous_browser_digest | length > 0)
         | ternary(wbparser_previous_browser_digest, wbparser_browser_digest) }}
+      # В check mode ничего не применялось: контейнеры не поднимались,
+      # healthcheck не проверялся, логи не читались. Diff выше — это и есть
+      # ответ на вопрос «что изменится».
+      - >-
+        {{ 'Dry run: nothing was applied — the diff above is what the deploy '
+           'would change. The containers were not started and their health was '
+           'not checked.'
+           if ansible_check_mode
+           else 'Deployed.' }}

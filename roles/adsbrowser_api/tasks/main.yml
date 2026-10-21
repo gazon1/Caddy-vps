@@ -40,6 +40,10 @@
   register: adsbrowser_api_existing_check
   changed_when: false
   failed_when: false
+  # В check mode команда не выполняется — результата нет, и читать нечего.
+  # Отвечает этот проб на вопрос «стоит ли ставить пакет», и в dry run
+  # вопрос не задаётся: цепочка установки ниже тоже пропускается.
+  when: not ansible_check_mode
 
 - name: Read currently deployed version
   ansible.builtin.slurp:
@@ -47,16 +51,16 @@
   register: adsbrowser_api_current_version_slurp
   changed_when: false
   failed_when: false
-  when: adsbrowser_api_existing_check.rc == 0
+  when: (adsbrowser_api_existing_check.rc | default(1)) == 0
 
 - name: Report currently deployed version
   ansible.builtin.debug:
     msg: >-
       Currently deployed:
       {{ adsbrowser_api_current_version_slurp.content | b64decode | trim }}
-  when: >-
-    adsbrowser_api_existing_check.rc == 0 and
-    adsbrowser_api_current_version_slurp.content is defined
+  when:
+    - (adsbrowser_api_existing_check.rc | default(1)) == 0
+    - adsbrowser_api_current_version_slurp.content is defined
 
 # ── Backup previous install (for rollback) ────────────────────────────────────
 
@@ -65,10 +69,13 @@
     cmd: "cp -a {{ adsbrowser_api_install_dir }} {{ adsbrowser_api_install_dir }}.backup"
   register: adsbrowser_api_backup
   changed_when: true
-  when: >-
-    adsbrowser_api_existing_check.rc == 0 and
-    adsbrowser_api_version !=
-    (adsbrowser_api_current_version_slurp.content | b64decode | trim | default(''))
+  when:
+    # Копия каталога — это запись на хост. В check mode команда и так не
+    # выполняется, но пропуск здесь явный: сухой прогон ничего не пишет.
+    - not ansible_check_mode
+    - (adsbrowser_api_existing_check.rc | default(1)) == 0
+    - adsbrowser_api_version !=
+      (adsbrowser_api_current_version_slurp.content | b64decode | trim | default(''))
 
 # ── Copy + verify tarball ─────────────────────────────────────────────────────
 
@@ -79,11 +86,14 @@
     dest: "/tmp/adspower-browser-{{ adsbrowser_api_version }}.tgz"
     mode: "0644"
   notify: Restart adsbrowser-api
-  when: >-
-    not (adsbrowser_api_existing_check.rc == 0) or
-    adsbrowser_api_version !=
-    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
-     default(adsbrowser_api_version))
+  when:
+    # В check mode цепочка установки пропускается: она опирается на пробу,
+    # которая не выполнялась, и потому неизвестно, что и как изменилось бы.
+    - not ansible_check_mode
+    - (adsbrowser_api_existing_check.rc | default(1)) != 0
+      or adsbrowser_api_version !=
+      (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+       default(adsbrowser_api_version))
 
 - name: Compute sha256 of the tarball
   ansible.builtin.command:
@@ -91,23 +101,27 @@
       sha256sum /tmp/adspower-browser-{{ adsbrowser_api_version }}.tgz
   register: adsbrowser_api_sha_check
   changed_when: false
-  when: >-
-    not (adsbrowser_api_existing_check.rc == 0) or
-    adsbrowser_api_version !=
-    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
-     default(adsbrowser_api_version))
+  when:
+    # Как и выше: файл на хосте в dry run не появился, хешировать нечего, а
+    # команда в check mode не выполняется.
+    - not ansible_check_mode
+    - (adsbrowser_api_existing_check.rc | default(1)) != 0
+      or adsbrowser_api_version !=
+      (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+       default(adsbrowser_api_version))
 
 - name: Fail if sha256 does not match
   ansible.builtin.fail:
     msg: >-
       Tarball sha256 mismatch.
       Expected: {{ adsbrowser_api_tarball_sha256 }}
-      Got: {{ adsbrowser_api_sha_check.stdout.split()[0] }}
+      Got: {{ (adsbrowser_api_sha_check.stdout | default('')) | trim | split | first | default('') }}
       Update adsbrowser_api_tarball_sha256 in defaults/main.yml.
-  when: >-
-    adsbrowser_api_sha_check is defined and
-    adsbrowser_api_sha_check.stdout.split()[0] !=
-    adsbrowser_api_tarball_sha256
+  when:
+    - not ansible_check_mode
+    - adsbrowser_api_sha_check is defined
+    - (adsbrowser_api_sha_check.stdout | default('') | trim | split | first | default(''))
+      != adsbrowser_api_tarball_sha256
 
 # ── Install / upgrade from tarball ───────────────────────────────────────────
 
@@ -120,11 +134,13 @@
       - --overwrite
     creates: "{{ adsbrowser_api_install_dir }}/cli/index.js"
   notify: Restart adsbrowser-api
-  when: >-
-    not (adsbrowser_api_existing_check.rc == 0) or
-    adsbrowser_api_version !=
-    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
-     default(adsbrowser_api_version))
+  when:
+    # Цепочка установки: в check mode она пропускается (см. выше).
+    - not ansible_check_mode
+    - (adsbrowser_api_existing_check.rc | default(1)) != 0
+      or adsbrowser_api_version !=
+      (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+       default(adsbrowser_api_version))
 
 - name: Link ads binary to /usr/local/bin
   ansible.builtin.file:
@@ -133,11 +149,13 @@
     state: link
     mode: "0755"
   notify: Restart adsbrowser-api
-  when: >-
-    not (adsbrowser_api_existing_check.rc == 0) or
-    adsbrowser_api_version !=
-    (adsbrowser_api_current_version_slurp.content | b64decode | trim |
-     default(adsbrowser_api_version))
+  when:
+    # Цепочка установки: в check mode она пропускается (см. выше).
+    - not ansible_check_mode
+    - (adsbrowser_api_existing_check.rc | default(1)) != 0
+      or adsbrowser_api_version !=
+      (adsbrowser_api_current_version_slurp.content | b64decode | trim |
+       default(adsbrowser_api_version))
 
 # ── Systemd unit ─────────────────────────────────────────────────────────────
 
@@ -167,6 +185,9 @@
 - name: Reload systemd daemon to pick up new unit
   ansible.builtin.systemd:
     daemon_reload: true
+  # В check mode перечитывать демон нечего: юнит-файл на хосте не появился
+  # (copy в dry run только показывает diff).
+  when: not ansible_check_mode
 
 # ── Enable + start ────────────────────────────────────────────────────────────
 
@@ -176,6 +197,10 @@
     enabled: true
     state: started
   register: adsbrowser_api_service_start
+  # В check mode сервис не включается и не запускается: сухой прогон ничего
+  # не запускает. И юнит-файла на хосте ещё нет, поэтому модуль упал бы с
+  # «юнит не найден» — пропускаем явно.
+  when: not ansible_check_mode
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 
@@ -184,10 +209,17 @@
     argv: [ads, check-status, -k, "{{ adsbrowser_api_key }}"]
   register: adsbrowser_api_health
   changed_when: false
+  # В check mode команда не выполняется — ответа Local API нет, и читать
+  # нечего. Проба описывает состояние прямо сейчас, а выкат может это
+  # состояние как раз и починить.
+  when: not ansible_check_mode
 
 - name: Report AdsPower Local API status
   ansible.builtin.debug:
-    msg: "AdsPower Local API: {{ adsbrowser_api_health.stdout | trim }}"
+    msg: "AdsPower Local API: {{ (adsbrowser_api_health.stdout | default('')) | trim }}"
+  # В check mode статуса нет: команда не выполнялась, и пустая строка
+  # выглядела бы как ответ Local API.
+  when: not ansible_check_mode
 
 # ── Rollback on failure ───────────────────────────────────────────────────────
 
@@ -197,17 +229,24 @@
       AdsPower Local API health check failed.
       Restoring previous version.
       Check: journalctl -u {{ adsbrowser_api_service_name }} -n 50
-  when: adsbrowser_api_health.rc != 0
+  when:
+    - not ansible_check_mode
+    - (adsbrowser_api_health.rc | default(1)) != 0
 
 - name: Write version state file
   ansible.builtin.copy:
     dest: "{{ adsbrowser_api_state_file }}"
     content: "{{ adsbrowser_api_version }}"
     mode: "0644"
-  when: adsbrowser_api_health.rc == 0
+  # В обычном прогоне файл состояния пишется только после успешной проверки
+  # здоровья. В check mode проверки не было, поэтому файл показывается как он
+  # был бы записан — diff показывает, что изменится.
+  when: ansible_check_mode or (adsbrowser_api_health.rc | default(1)) == 0
 
 - name: Report deployment complete
   ansible.builtin.debug:
     msg: >-
-      adsbrowser_api {{ adsbrowser_api_version }} deployed.
-      State saved to {{ adsbrowser_api_state_file }}.
+      {{ 'Dry run: adsbrowser_api ' ~ adsbrowser_api_version ~ ' was NOT deployed.'
+         ~ ' Nothing was applied.' if ansible_check_mode
+         else 'adsbrowser_api ' ~ adsbrowser_api_version ~ ' deployed.'
+         ~ ' State saved to ' ~ adsbrowser_api_state_file ~ '.' }}

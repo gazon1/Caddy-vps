@@ -67,6 +67,10 @@
       register: caddy_container_state
       changed_when: false
       failed_when: caddy_container_state.rc != 0 or caddy_container_state.stdout != 'true'
+      # В check mode команда не выполняется — результата нет, и читать нечего.
+      # Проверка описывает состояние прокси прямо сейчас, а сухой прогон не
+      # должен на нём падать: выкат может это состояние как раз и починить.
+      when: not ansible_check_mode
 
     - name: Remember whether a previous version of this snippet exists
       ansible.builtin.stat:
@@ -119,6 +123,11 @@
               - /etc/caddy/Caddyfile
           register: caddy_snippet_validate
           changed_when: false
+          # В check mode сниппет на хосте не появился (copy в dry run только
+          # показывает diff), и валидировать было бы СТАРУЮ конфигурацию —
+          # она ничего не говорит о новом сниппете. Поэтому проверка в dry run
+          # пропускается явно, а не делает вид, что конфигурация проверена.
+          when: not ansible_check_mode
 
       rescue:
 
@@ -154,6 +163,8 @@
           register: caddy_rollback_validate
           changed_when: false
           failed_when: false
+          # В check mode откатывать было нечего: сниппет на хосте не изменился.
+          when: not ansible_check_mode
 
         - name: Report that this snippet was at fault
           ansible.builtin.fail:
@@ -162,16 +173,22 @@
               back to its previous version. The rest of the configuration is fine —
               the snippet above is what Caddy rejects:
               {{ caddy_snippet_validate.stderr | default('') | trim }}
-          when: caddy_rollback_validate.rc == 0
+          when: (caddy_rollback_validate.rc | default(1)) == 0
 
         - name: Report that the breakage predates this run
           ansible.builtin.fail:
             msg: >-
+              {% if ansible_check_mode %}
+              Route snippet '{{ caddy_route_name }}' could not be applied. This was a
+              dry run: nothing was written, nothing was rolled back — the diff
+              above is what the deploy would change.
+              {% else %}
               Route snippet '{{ caddy_route_name }}' was applied, but the resulting
               configuration is invalid AND the rolled-back one fails too. So the
               breakage predates this run and this snippet is not necessarily to
               blame. Check the other files in {{ caddy_conf_d }}:
               {{ caddy_rollback_validate.stderr | default('') | trim }}
+              {% endif %}
 
     # ---------------------------------------------------------------------
     # Reachability probe — deliberately OUTSIDE the block/rescue above.
@@ -216,7 +233,12 @@
       register: caddy_route_probe
       changed_when: false
       failed_when: false
-      when: caddy_route_url | length > 0
+      # В check mode команда не выполняется — ответа нет, и читать нечего.
+      # Проба описывает маршрут прямо сейчас, а сухой прогон не должен на нём
+      # падать: маршрут может подняться именно этим выкатом.
+      when:
+        - not ansible_check_mode
+        - caddy_route_url | length > 0
 
     # 2xx/3xx/4xx all mean the application answered, so routing works. curl
     # prints 000 when it never got a response at all — a dead TLS handshake, a
@@ -224,7 +246,9 @@
     - name: Work out whether the route answered
       ansible.builtin.set_fact:
         caddy_route_status: "{{ caddy_route_probe.stdout | default('000') | trim }}"
-      when: caddy_route_url | length > 0
+      when:
+        - not ansible_check_mode
+        - caddy_route_url | length > 0
 
     - name: Report an unreachable route
       ansible.builtin.fail:
@@ -243,5 +267,8 @@
         probe_detail: >-
           {{ caddy_route_probe.stderr | default('') | trim }}
       when:
+        # Первым — иначе условие ниже читало бы результат пробы, которой в
+        # check mode не было.
+        - not ansible_check_mode
         - caddy_route_url | length > 0
         - caddy_route_status | int < 200 or caddy_route_status | int >= 500
