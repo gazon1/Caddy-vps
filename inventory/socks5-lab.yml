@@ -1,0 +1,35 @@
+---
+# The lab inventory: one endpoint inside a container.
+#
+# The connection is `docker`: the playbook runs INSIDE the container. That is
+# the only way to prove a role that installs packages, writes /etc and creates
+# an account without touching the machine it is developed on.
+#
+# The container needs python3 before the playbook can connect to it: Ansible's
+# control code runs on the target. The lab script installs it.
+all:
+  children:
+    egress:
+      hosts:
+        lab:
+          ansible_connection: docker
+          # The docker connection takes the container's name from ansible_host.
+          # Without it, it would look for a container called `lab` — the
+          # inventory's host name — and not find the one the lab started.
+          ansible_host: socks5_lab
+          ansible_python_interpreter: /usr/bin/python3
+          # The container has no HOME, so Ansible's default remote temp path
+          # (`~/.ansible/tmp`) cannot be created there. /tmp is writable.
+          ansible_remote_tmp: "/tmp/.ansible/tmp"
+          # The lab runs as root inside the container already.
+          ansible_become: false
+          socks5_become: false
+          # There is no init inside a container: the proxy runs as a plain
+          # process. This is the `none` service mode.
+          socks5_service_mode: "none"
+          socks5_username: "egress"
+          socks5_password: "lab-proxy-password"
+          socks5_client_cidrs:
+            - "172.17.0.1/32"
+          socks5_probe_target_host: "1.1.1.1"
+          socks5_probe_target_port: 80

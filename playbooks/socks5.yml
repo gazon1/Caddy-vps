@@ -1,0 +1,36 @@
+---
+# ==============================================================================
+# Provision the SOCKS5 endpoints of the egress fleet.
+#
+#   just socks5-deploy
+#   just socks5-deploy -e socks5_password=…        # or SOCKS5_PASSWORD in the env
+#
+# The hosts are the `egress` group of the inventory: one host = one egress
+# address = one egress group of the crawler. The crawler is not multiplied —
+# the addresses are (see the application repository's ADR
+# `2026-11-01-one-crawler-many-addresses`).
+# ==============================================================================
+
+- name: Check the inventory before touching any host
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    # A playbook that quietly does nothing because the inventory was not filled
+    # in is a green deploy that deployed nothing. The operator has to be told.
+    - name: Fail when the inventory names no endpoint host
+      ansible.builtin.assert:
+        that:
+          - groups['egress'] | default([]) | length > 0
+        fail_msg: >-
+          The inventory names no endpoint host. Add one to the `egress` group
+          in inventory/hosts.yml — one host per egress address. The role will
+          not start an endpoint nobody asked for.
+        quiet: true
+
+- name: Provision the SOCKS5 endpoints
+  hosts: egress
+  become: "{{ ansible_become | default(false) }}"
+  gather_facts: true
+  roles:
+    - role: socks5

@@ -1,0 +1,97 @@
+---
+# ==============================================================================
+# Defaults for the socks5 role.
+#
+# One endpoint = one egress address = one egress group of the crawler.
+#
+# The crawler is NOT multiplied — the addresses are. The endpoint is a SOCKS5
+# server on a host of its own; the crawler's AdsPower profile points at it.
+# See the application repository's ADR
+# `docs/decisions/2026-11-01-one-crawler-many-addresses.md`.
+#
+# What the endpoint has to be:
+#   • reachable ONLY from the crawler's address — the refusal is the
+#     endpoint's own, not the firewall's (a firewall rule that fails open is
+#     worse than no firewall at all);
+#   • authenticated — a username and a password checked against the system's
+#     user database, never an anonymous access;
+#   • idempotent — a second run changes nothing.
+# ==============================================================================
+
+# --- The listener -------------------------------------------------------------
+socks5_port: 1080
+
+# The address the endpoint announces to clients: the one the crawler dials.
+# On a VPS with a public address this is the address itself; behind NAT it is
+# the address the crawler reaches, which is the operator's to state.
+#
+# Left empty, the role takes the host's own primary address — which is wrong
+# behind NAT, and the proxy refuses to start when it cannot bind the address
+# it was told to announce. That is the intended way to fail.
+socks5_external_address: ""
+
+# --- Who may use the endpoint -------------------------------------------------
+# REQUIRED. The crawler's address, one CIDR per entry. Everyone else is
+# refused by the proxy itself.
+socks5_client_cidrs: []
+
+# Whether the endpoint's own loopback may use it. On by default: the role
+# verifies itself through it after every change, and a loopback client is not
+# an exposure — nothing outside the host can source a connection from
+# 127.0.0.1.
+socks5_allow_localhost: true
+
+# --- The account --------------------------------------------------------------
+# The system account the proxy authenticates. It exists to be a name in the
+# user's database: no shell, no home, no password reuse.
+socks5_username: "egress"
+
+# REQUIRED. The password.
+#
+# From Ansible Vault:
+#   ansible-vault encrypt_string '…' --name 'socks5_password'
+# or from the environment:
+#   export SOCKS5_PASSWORD='…'
+#
+# NOT on the command line: a command line is visible in the process list and in
+# the shell history, and a password that leaks there has leaked.
+socks5_password: ""
+
+# Whether a changed password is pushed to the host. Off by default: the account
+# is created WITH its password, and a routine run does not rewrite it — the
+# password is a secret, and rewriting it on every run would report a change
+# that did not happen.
+#
+# A rotation is a deliberate act:
+#   just socks5-deploy -e socks5_force_password_update=true
+socks5_force_password_update: false
+
+# Where the password is written on the target before chpasswd reads it. The
+# file exists for the seconds the task needs it, with mode 0600, and is
+# removed right after.
+socks5_password_file: "/root/.socks5-password.tmp"
+
+# --- The verification target --------------------------------------------------
+# The TCP target the role connects to THROUGH the proxy when it verifies
+# itself. It is a TCP target, not a service: the proxy only has to open a
+# connection to it. No third-party API is in the loop, and no third-party API
+# being down can fail the deploy.
+socks5_probe_target_host: "1.1.1.1"
+socks5_probe_target_port: 80
+
+# --- How the service is run ---------------------------------------------------
+# auto    — systemd when the host has it, a plain process otherwise
+# systemd — systemd, and the role fails if the host has none
+# none    — a plain process (the lab runs the role inside a container, where
+#           there is no init to register a service with)
+socks5_service_mode: "auto"
+
+# --- Paths --------------------------------------------------------------------
+socks5_config_path: "/etc/danted.conf"
+socks5_package: "dante-server"
+
+# --- Privileges ---------------------------------------------------------------
+# The role installs packages, writes /etc and manages an account, so it needs
+# root. The lab runs it inside a container where the play is already root, and
+# sets this to false.
+socks5_become: true

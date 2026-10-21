@@ -42,6 +42,7 @@ jobs:
           playbooks/wbshop.yml
           playbooks/wbparser.yml
           playbooks/adsbrowser-cleanup.yml
+          playbooks/socks5.yml
 
       - name: yamllint
         run: yamllint .
@@ -68,3 +69,6 @@ jobs:
 
       - name: Run the lab suite
         run: bash tests/lab.sh
+
+      - name: Run the socks5 lab suite
+        run: bash tests/socks5-lab.sh
