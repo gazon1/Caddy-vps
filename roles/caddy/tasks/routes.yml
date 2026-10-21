@@ -29,6 +29,20 @@
           Nothing to apply: set caddy_route_src to a Caddyfile fragment, or
           caddy_route_content to an already-rendered one.
 
+    # ── One address, one route ───────────────────────────────────────────────
+    #
+    # The rule is checked, not documented: a snippet may not claim an address
+    # that another installed snippet already claims. Two routes for one
+    # address merge into one site block with two catch-alls, and which
+    # upstream answers a path then depends on the order the files happen to
+    # be merged in.
+    #
+    # The check lives in its own file so the lab can exercise it without
+    # applying a route.
+    - name: Check that no other snippet claims the same address
+      ansible.builtin.import_tasks: route-addresses.yml
+      when: not ansible_check_mode
+
     # caddy_route_src is a path on the CONTROL node, not on the target: the
     # "Install the snippet" copy below reads it from there. Checking it on the
     # managed host looks like it works and does not — the lab suite connects

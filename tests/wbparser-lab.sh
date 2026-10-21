@@ -21,6 +21,7 @@
 #         and the proxy answers through it
 #   T11 — a registry answer that names no digest is refused, and nothing changes
 #   T12 — the first apply of a route waits for the certificate it does not have yet
+#   T13 — a second route for an address that is already taken is refused
 #
 # The images come from a throwaway registry on localhost, not from GHCR: the
 # lab needs two images in the SAME repository, one that becomes healthy and one
@@ -823,6 +824,49 @@ if ask_route >/dev/null 2>&1; then
 else
     fail "the first route stopped answering"
 fi
+
+# ==============================================================================
+step "T13 — a second route for an address that is already taken is refused"
+# The defect this catches: two snippets claiming one address do not compose.
+# Caddy merges two site blocks with the same name, and with two catch-alls the
+# upstream that answers a path depends on the order the files happen to be
+# merged in. The deploy looked green either way.
+#
+# The check lives in the role, so the refusal is the role's: nothing is
+# written, and the snippet that was already there is untouched.
+CONFLICT_SNIPPET="$(mktemp)"
+cat > "$CONFLICT_SNIPPET" <<'SNIPPET'
+wb-parser.localhost {
+    reverse_proxy somewhere-else:3000
+}
+SNIPPET
+OUT="$(mktemp)"
+if ansible-playbook -i "$INVENTORY" "$REPO_ROOT/site.yml" \
+    --tags caddy_routes \
+    -e "caddy_route_name=wbparser-conflict" \
+    -e "caddy_route_src=$CONFLICT_SNIPPET" \
+    "${CADDY_LAB_VARS[@]}" > "$OUT" 2>&1; then
+    fail "the deploy applied a second route for an address that was already taken"
+    tail -30 "$OUT"
+else
+    if grep -q 'is already claimed by' "$OUT"; then
+        pass "the deploy refused the second route and said which file holds the address"
+    else
+        fail "the deploy failed, but not with the conflict message"
+        tail -30 "$OUT"
+    fi
+    if [ -f "$CADDY_LAB_BASE/conf.d/wbparser-conflict.caddy" ]; then
+        fail "the refused route was written anyway"
+    else
+        pass "nothing was written"
+    fi
+    if grep -q "$LAB_SITE" "$CADDY_LAB_BASE/conf.d/wbparser.caddy" 2>/dev/null; then
+        pass "the route that was already there is untouched"
+    else
+        fail "the route that was already there was damaged"
+    fi
+fi
+rm -f "$OUT" "$CONFLICT_SNIPPET"
 
 # ==============================================================================
 echo

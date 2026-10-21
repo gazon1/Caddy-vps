@@ -1,0 +1,199 @@
+---
+# Apply one route snippet to the proxy — from another repository.
+#
+# Why this file exists. A route belongs to the project it serves: the
+# storefront's route lives in the storefront repository, and its CI compares
+# the copy on the server with that file by checksum. But the thing that
+# installs a route is the role in THIS repository — so the file has to be
+# brought here to be applied, and until now the only way to do that was a
+# developer machine with both repositories checked out. The deploy of the
+# crawler already works this way (deploy-wbparser.yml takes the crawler's
+# compose file from the crawler's repository), and this is the same arrangement
+# for a route.
+#
+# It refuses to do the unsafe thing: the role checks that no other snippet on
+# the host already claims the address this one names, so applying a route for
+# an address that is taken fails with an explanation instead of producing two
+# routes for one address.
+#
+# A dry run is the default. It shows what would change and applies nothing.
+name: Apply a route
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Репозиторий, из которого берётся файл маршрута"
+        required: false
+        default: "gazon1/product-catalog"
+        type: string
+      ref:
+        description: "Реф этого репозитория"
+        required: false
+        default: "main"
+        type: string
+      path:
+        description: "Путь к файлу маршрута в этом репозитории"
+        required: false
+        default: "deploy/caddy.conf.caddy"
+        type: string
+      name:
+        description: "Имя маршрута — имя файла в conf.d"
+        required: false
+        default: "product-catalog"
+        type: string
+      check_only:
+        description: "Сухой прогон: показать, что изменится, и ничего не применить"
+        required: false
+        default: true
+        type: boolean
+  repository_dispatch:
+    types: [route-requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apply-route
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Забрать репозиторий с файлом маршрута
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository || github.event.client_payload.repository }}
+          ref: ${{ inputs.ref || github.event.client_payload.ref }}
+          path: route-source
+
+      - name: Проверить, что файл маршрута на месте
+        env:
+          REPOSITORY: ${{ inputs.repository || github.event.client_payload.repository }}
+          REF: ${{ inputs.ref || github.event.client_payload.ref }}
+          ROUTE_PATH: ${{ inputs.path || github.event.client_payload.path }}
+        run: |
+          set -euo pipefail
+          route="$GITHUB_WORKSPACE/route-source/$ROUTE_PATH"
+          if [ ! -f "$route" ]; then
+            echo "::error::В $REPOSITORY@$REF нет $ROUTE_PATH — применять нечего."
+            exit 1
+          fi
+          echo "route: $route"
+
+      - name: Поставить Ansible и коллекции
+        run: |
+          set -euo pipefail
+          if command -v pipx >/dev/null 2>&1; then
+            pipx install ansible-core
+            pipx inject ansible-core requests
+          else
+            python3 -m pip install --user --break-system-packages ansible-core requests
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          ansible-galaxy collection install -r requirements.yml
+          ansible-playbook --version
+
+      - name: Проверить, что SSH-секреты на месте
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in VPS_HOST VPS_USER VPS_PORT VPS_SSH_KEY; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Нет секретов репозитория: ${missing[*]}."
+            echo "::error::Создать: Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Довериться ключу хоста VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -uo pipefail
+          mkdir -p ~/.ssh
+          for attempt in 1 2 3; do
+            if ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
+              chmod 600 ~/.ssh/known_hosts
+              echo "the host key is on port $VPS_PORT (attempt $attempt)"
+              exit 0
+            fi
+            echo "::notice::попытка $attempt: хост не отдал ключ на порту $VPS_PORT"
+            sleep 10
+          done
+          echo "::error::VPS не отдал ключ хоста на порту $VPS_PORT за три попытки."
+          echo "::error::Проверить: nc -vz <host> $VPS_PORT — и доступность машины, и состояние sshd на ней."
+          exit 1
+
+      - name: Собрать инвентарь
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/inventory.yml" <<EOF
+          all:
+            hosts:
+              vps-1:
+                ansible_host: ${VPS_HOST}
+                ansible_user: ${VPS_USER}
+                ansible_port: ${VPS_PORT}
+                ansible_become: true
+                ansible_become_method: sudo
+          EOF
+          echo "inventory: $RUNNER_TEMP/inventory.yml"
+
+      - name: Применить маршрут
+        env:
+          ROUTE_FILE: ${{ github.workspace }}/route-source/${{ inputs.path || github.event.client_payload.path }}
+          ROUTE_NAME: ${{ inputs.name || github.event.client_payload.name }}
+          CHECK_ONLY: ${{ inputs.check_only }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$CHECK_ONLY" = "true" ]; then
+            args+=(--check --diff)
+          fi
+          ansible-playbook site.yml \
+            -i "$RUNNER_TEMP/inventory.yml" \
+            --tags caddy_routes \
+            -e "caddy_route_name=${ROUTE_NAME}" \
+            -e "caddy_route_src=${ROUTE_FILE}" \
+            ${args[@]+"${args[@]}"}
+
+      - name: Итог
+        if: always()
+        env:
+          REPOSITORY: ${{ inputs.repository || github.event.client_payload.repository }}
+          REF: ${{ inputs.ref || github.event.client_payload.ref }}
+          ROUTE_PATH: ${{ inputs.path || github.event.client_payload.path }}
+          ROUTE_NAME: ${{ inputs.name || github.event.client_payload.name }}
+          CHECK_ONLY: ${{ inputs.check_only }}
+        run: |
+          {
+            echo "### Итог"
+            echo ""
+            if [ "$CHECK_ONLY" = "true" ]; then
+              echo "- Режим: сухой прогон (\`--check\`), ничего не применялось"
+            else
+              echo "- Режим: применение"
+            fi
+            echo "- Маршрут: \`${ROUTE_NAME}\` из \`${REPOSITORY}@${REF}:${ROUTE_PATH}\`"
+            echo "- Прогон: https://github.com/${{ github.repository }}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
